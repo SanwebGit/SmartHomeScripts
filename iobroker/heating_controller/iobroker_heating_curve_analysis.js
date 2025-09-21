@@ -1,7 +1,7 @@
 /**
  * @fileoverview Heating Curve Analysis Script ("Air Traffic Control")
  * @version 2.1 - Intelligent comparison with adaptive boiler automation
- * @author Your Name
+ * @author Sanweb
  * @license MIT
  *
  * PURPOSE OF THE SCRIPT:
