@@ -1,0 +1,230 @@
+/**
+ * @fileoverview Central, intelligent & modulating heating control for ioBroker
+ * @version 2.4 (Final) - Optimized trigger timing
+ * @author Sanweb
+ * @license MIT
+ *
+ * PURPOSE OF THE SCRIPT:
+ * This script is the "control tower" of the heating system. It determines the total heating demand
+ * from all individual rooms, considers the learned efficiency factor ('controller performance'),
+ * and controls the central heating boiler through intelligent, dynamic shifting
+ * of the weather-compensated heating curve.
+ * NEW in v2.4: Optimized the time base of the trigger to avoid load peaks.
+ *
+ * REQUIRED DEVICES / DATA POINTS:
+ * - Thermostats for each room to be controlled.
+ * -> Required Datapoints: 'SET_POINT_TEMPERATURE', 'ACTUAL_TEMPERATURE', 'LEVEL' (valve opening).
+ * - An adapter to control the central boiler (e.g., ebusd via MQTT).
+ * -> Datapoints to set operating mode, heating curve, and target day temperature.
+ * - The output datapoints from the analysis and optimization scripts.
+ * -> '0_userdata.0.Heizung.Optimierung.Reglerleistung'
+ * -> '0_userdata.0.Heizung.Analyse.EmpfohleneSteilheit'
+ * - A system variable indicating if the heating period is active.
+ */
+
+// -------------------------------------------------------------------------------------
+// 1. CENTRAL CONFIGURATION
+// All user-specific settings are made here.
+// -------------------------------------------------------------------------------------
+const CONFIG = {
+    // --- A. BASIC SETTINGS ---
+    autoCreateStates: true,       // If true, automatically creates the required output states.
+    debugLogAktiv: true,          // Master switch for log outputs.
+    toleranzTemp: 0.2,            // Tolerance in °C. A demand is registered if the actual temp is below (setpoint - tolerance).
+    
+    // Parameters for heating curve control
+    heizkurvenSteuerungAktiv: true, // Master switch for dynamic heating curve control.
+    basisHeizkurve: 1.2,          // Fallback value if no recommendation from the analysis script is available.
+    maxHeizkurvenAnpassung: 0.3,  // The maximum value the heating curve can be dynamically shifted up or down.
+
+    // --- B. ROOM CONFIGURATION ---
+    // Add all rooms that should be considered for demand calculation.
+    rooms: [
+        { roomName: 'Living Room', thermostatSetPointId: 'hm-rpc.2.INT0000005.1.SET_POINT_TEMPERATURE' },
+        { roomName: 'Bedroom',   thermostatSetPointId: 'hm-rpc.2.INT0000001.1.SET_POINT_TEMPERATURE' },
+        { roomName: 'Bathroom',  thermostatSetPointId: 'hm-rpc.2.INT0000002.1.SET_POINT_TEMPERATURE' },
+        { roomName: 'Kitchen',     thermostatSetPointId: 'hm-rpc.2.INT0000003.1.SET_POINT_TEMPERATURE' },
+        { roomName: 'Dining Room',  thermostatSetPointId: 'hm-rpc.2.INT0000004.1.SET_POINT_TEMPERATURE' },
+    ],
+
+    // --- C. EBUS ADAPTER CONFIGURATION (or other boiler adapter) ---
+    // Datapoints to send commands to the boiler.
+    ebus: {
+        setOpModeId: 'mqtt.1.ebusd.700.Z1OpMode.set',      // Set the operating mode (e.g., 0=off, 1=auto)
+        setHeatCurveId: 'mqtt.1.ebusd.700.Hc1HeatCurve.set', // Set the heating curve slope (e.g., 1.2)
+        setDayTempId: 'mqtt.1.ebusd.700.Z1DayTemp.set',    // Set the target day temperature for the heating circuit
+    },
+
+    // --- D. ioBroker OBJECT IDs ---
+    // Input and output datapoints for the script's logic.
+    ids: {
+        svHeizperiodeId: 'hm-rega.0.1720',                                      // System variable for heating period (true/false)
+        reglerleistungId: '0_userdata.0.Heizung.Optimierung.Reglerleistung',    // Learned controller performance from the optimization script
+        statusGasthermeId: '0_userdata.0.Heizung.Zentral.StatusTherme',         // Output: General heating demand status (true/false)
+        hoechsteAnforderungId: '0_userdata.0.Heizung.Zentral.HoechsteAnforderungTemp', // Output: Highest requested temperature from any room
+        empfohleneSteilheitId: '0_userdata.0.Heizung.Analyse.EmpfohleneSteilheit', // Recommended base slope from the analysis script
+    }
+};
+
+// -------------------------------------------------------------------------------------
+// 2. SCRIPT INITIALIZATION
+// -------------------------------------------------------------------------------------
+async function createStates() {
+    if (!CONFIG.autoCreateStates) {
+        if (CONFIG.debugLogAktiv) log("[Central] Automatic creation of datapoints is disabled.");
+        return;
+    }
+
+    if (!(await existsStateAsync(CONFIG.ids.statusGasthermeId))) {
+        if (CONFIG.debugLogAktiv) log(`[Central] Datapoint ${CONFIG.ids.statusGasthermeId} not found. Will be created automatically...`, 'info');
+        await createStateAsync(CONFIG.ids.statusGasthermeId, false, { name: 'Status Gas Boiler', type: 'boolean', role: 'indicator', read: true, write: false, def: false });
+    }
+    if (!(await existsStateAsync(CONFIG.ids.hoechsteAnforderungId))) {
+        if (CONFIG.debugLogAktiv) log(`[Central] Datapoint ${CONFIG.ids.hoechsteAnforderungId} not found. Will be created automatically...`, 'info');
+        await createStateAsync(CONFIG.ids.hoechsteAnforderungId, 0, { name: 'Highest Temperature Demand', type: 'number', role: 'value.temperature', read: true, write: false, unit: '°C', def: 0 });
+    }
+    if (!(await existsStateAsync(CONFIG.ids.reglerleistungId))) {
+        if (CONFIG.debugLogAktiv) log(`[Central] Datapoint ${CONFIG.ids.reglerleistungId} not found. Will be created automatically...`, 'info');
+        await createStateAsync(CONFIG.ids.reglerleistungId, 1.0, { name: 'Heating Optimization Controller Performance', type: 'number', role: 'value', read: true, write: true, min: 0.0, max: 2.0, def: 1.0, unit: 'Factor' });
+    }
+}
+
+// -------------------------------------------------------------------------------------
+// 3. MAIN FUNCTION
+// -------------------------------------------------------------------------------------
+async function main() {
+    if (CONFIG.debugLogAktiv) log('[Central] Starting demand assessment...');
+
+    // If heating period is off, turn off the heating circuit and exit.
+    const heizperiodeState = await getStateAsync(CONFIG.ids.svHeizperiodeId);
+    if (!heizperiodeState || !heizperiodeState.val) {
+        if (CONFIG.debugLogAktiv) log("[Central] Heating period is 'off'. Switching off heating circuit.");
+        await setStateAsync(CONFIG.ids.statusGasthermeId, false, true);
+        await setStateAsync(CONFIG.ebus.setOpModeId, 0, true); // 0 = Off
+        return;
+    }
+
+    let maxSollTemp = 0;
+    let gesamtHeizbedarf = false;
+    let heizendeRaeume = 0;
+
+    // Iterate through all configured rooms to determine the total heating demand.
+    for (const room of CONFIG.rooms) {
+        const setPointId = room.thermostatSetPointId;
+        const actualTempId = setPointId.replace('SET_POINT_TEMPERATURE', 'ACTUAL_TEMPERATURE');
+        const levelId = setPointId.replace('SET_POINT_TEMPERATURE', 'LEVEL'); // Valve opening percentage
+
+        const sollTempState = await getStateAsync(setPointId);
+        const actualTempState = await getStateAsync(actualTempId);
+        const levelState = await getStateAsync(levelId);
+
+        if (sollTempState && actualTempState && levelState) {
+            const soll_Temp = sollTempState.val;
+            const akt_Temp = actualTempState.val;
+            const akt_Ventil = levelState.val;
+
+            // A room has a demand if the actual temp is below the setpoint (minus tolerance) OR if the valve is already open.
+            const hasDemand = (akt_Temp < (soll_Temp - CONFIG.toleranzTemp)) || (akt_Ventil >= 0.1);
+
+            if (hasDemand) {
+                gesamtHeizbedarf = true;
+                heizendeRaeume++;
+                if (soll_Temp > maxSollTemp) maxSollTemp = soll_Temp;
+            }
+        }
+    }
+
+    // Write the calculated overall status.
+    await setStateAsync(CONFIG.ids.statusGasthermeId, gesamtHeizbedarf, true);
+    await setStateAsync(CONFIG.ids.hoechsteAnforderungId, maxSollTemp, true);
+    
+    // Set the highest requested temperature as the target day temperature for the boiler.
+    if (gesamtHeizbedarf && maxSollTemp > 5.0) {
+        const finalDayTemp = parseFloat(maxSollTemp.toFixed(1));
+        if (CONFIG.debugLogAktiv) {
+            log(`[Central] Sending new target day temperature to boiler: ${finalDayTemp}°C`);
+        }
+        await setStateAsync(CONFIG.ebus.setDayTempId, finalDayTemp, true);
+    }
+    
+    // Set the boiler to automatic/heating mode.
+    await setStateAsync(CONFIG.ebus.setOpModeId, 1, true); // 1 = Auto
+
+    // --- Dynamic Heating Curve Control ---
+    if (CONFIG.heizkurvenSteuerungAktiv) {
+        // Use the recommended slope from the analysis script, or the fallback value.
+        const empfohleneSteilheitState = await getStateAsync(CONFIG.ids.empfohleneSteilheitId);
+        let aktuelleBasisHeizkurve = CONFIG.basisHeizkurve;
+
+        if (empfohleneSteilheitState && typeof empfohleneSteilheitState.val === 'number' && empfohleneSteilheitState.val > 0.1) {
+            aktuelleBasisHeizkurve = empfohleneSteilheitState.val;
+            if (CONFIG.debugLogAktiv) log(`[Central] Using recommended heating curve as base: ${aktuelleBasisHeizkurve}`);
+        } else {
+            if (CONFIG.debugLogAktiv) log(`[Central] Recommended heating curve not available. Using fallback base: ${aktuelleBasisHeizkurve}`);
+        }
+
+        // Get the learned controller performance factor.
+        const reglerleistungState = await getStateAsync(CONFIG.ids.reglerleistungId);
+        const reglerleistung = reglerleistungState ? reglerleistungState.val : 1.0;
+        
+        let anpassungsFaktor = 0.0;
+        const anzahlRaeume = CONFIG.rooms.length;
+
+        // Calculate the adjustment factor based on how many rooms are currently demanding heat.
+        if (gesamtHeizbedarf) {
+            // The more rooms need heat, the higher the curve is shifted (up to the max value).
+            // This is modulated by the learned 'reglerleistung' factor.
+            anpassungsFaktor = (heizendeRaeume / anzahlRaeume) * CONFIG.maxHeizkurvenAnpassung * reglerleistung;
+        } else {
+            // If there's no demand, slightly lower the curve to save energy.
+            anpassungsFaktor = -CONFIG.maxHeizkurvenAnpassung / 2;
+        }
+
+        let neueHeizkurve = aktuelleBasisHeizkurve + anpassungsFaktor;
+
+        // Limit the final curve to the defined maximum deviation from the base curve.
+        const minKurve = aktuelleBasisHeizkurve - CONFIG.maxHeizkurvenAnpassung;
+        const maxKurve = aktuelleBasisHeizkurve + CONFIG.maxHeizkurvenAnpassung;
+        if (neueHeizkurve > maxKurve) neueHeizkurve = maxKurve;
+        if (neueHeizkurve < minKurve) neueHeizkurve = minKurve;
+        
+        const finalCurve = parseFloat(neueHeizkurve.toFixed(1));
+
+        if (CONFIG.debugLogAktiv) {
+            log(`[Central] Heating load width: ${heizendeRaeume}/${anzahlRaeume} rooms. Controller performance: ${reglerleistung.toFixed(2)}.`);
+            log(`[Central] Sending new heating curve to boiler: ${finalCurve}`);
+        }
+        await setStateAsync(CONFIG.ebus.setHeatCurveId, finalCurve, true);
+
+    } else {
+        if (CONFIG.debugLogAktiv) {
+            log(`[Central] Heating curve control is disabled. No commands will be sent.`);
+        }
+    }
+}
+
+// -------------------------------------------------------------------------------------
+// 4. SCRIPT START & TRIGGERS
+// -------------------------------------------------------------------------------------
+(async () => {
+    await createStates();
+
+    // Collect all datapoints that should trigger a recalculation.
+    const triggerIds = [CONFIG.ids.svHeizperiodeId, CONFIG.ids.empfohleneSteilheitId];
+    CONFIG.rooms.forEach(room => {
+        triggerIds.push(room.thermostatSetPointId);
+        triggerIds.push(room.thermostatSetPointId.replace('SET_POINT_TEMPERATURE', 'ACTUAL_TEMPERATURE'));
+        triggerIds.push(room.thermostatSetPointId.replace('SET_POINT_TEMPERATURE', 'LEVEL'));
+    });
+    
+    on(triggerIds, main);
+    
+    // Safety trigger to run periodically.
+    // Optimized timing to avoid collisions with other scripts (e.g., that run at :00, :15, :30, :45).
+    schedule('5,20,35,50 * * * *', main);
+    
+    // Run once after script start for initialization.
+    setTimeout(main, 5000);
+})();
+
+
