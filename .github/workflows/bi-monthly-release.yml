@@ -1,0 +1,66 @@
+name: Multi Monthly Release
+
+on:
+  schedule:
+    - cron: '0 4 * * *' # Täglich um 04:00 Uhr Prüfung auf Release-Tag
+  workflow_dispatch: # Manueller Start möglich
+
+jobs:
+  check-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Holt alle Tags für das Hochzählen der Version
+
+      - name: Check if today is a release day
+        id: check_day
+        run: |
+          SEED=$(date +%Y%m)
+          DAY1=$(( (SEED % 14) + 1 ))
+          DAY2=$(( (SEED % 14) + 15 ))
+          CURRENT_DAY=$(date +%-d)
+          if [ "$CURRENT_DAY" -eq "$DAY1" ] || [ "$CURRENT_DAY" -eq "$DAY2" ]; then
+            echo "match=true" >> $GITHUB_OUTPUT
+          else
+            echo "match=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate Dynamic Version Tag
+        if: steps.check_day.outputs.match == 'true'
+        id: tag
+        run: |
+          # Letzten Tag suchen, der dem Schema vX.X.X entspricht
+          LATEST_TAG=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || echo "v1.0.0")
+          
+          # Extrahiere Major.Minor.Patch (z.B. 1.0.0)
+          VERSION_BASE=$(echo $LATEST_TAG | sed 's/v//' | cut -d. -f1,2,3)
+          MAJOR=$(echo $VERSION_BASE | cut -d. -f1)
+          MINOR=$(echo $VERSION_BASE | cut -d. -f2)
+          PATCH=$(echo $VERSION_BASE | cut -d. -f3)
+          
+          # Patch-Version um 1 erhöhen
+          NEW_PATCH=$((PATCH + 1))
+          NEW_VERSION="$MAJOR.$MINOR.$NEW_PATCH"
+          
+          # Finales Tag mit Datum generieren
+          FINAL_TAG="v$NEW_VERSION.$(date +'%Y%m%d')"
+          echo "tag_name=$FINAL_TAG" >> $GITHUB_OUTPUT
+
+      - name: Create ZIP of Scripts
+        if: steps.check_day.outputs.match == 'true'
+        run: zip -r smarthome_scripts_${{ steps.tag.outputs.tag_name }}.zip iobroker/
+
+      - name: Create GitHub Release
+        if: steps.check_day.outputs.match == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag_name }}
+          name: Automated Snapshot ${{ steps.tag.outputs.tag_name }}
+          body: |
+            Bi-monthly automated snapshot of productive ioBroker scripts.
+            Version incremented automatically.
+          files: smarthome_scripts_${{ steps.tag.outputs.tag_name }}.zip
