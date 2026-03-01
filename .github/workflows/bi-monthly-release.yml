@@ -1,4 +1,4 @@
-name: Bi-Monthly Random Release
+name: Monthly Random Release
 
 on:
   schedule:
@@ -18,6 +18,7 @@ jobs:
 
       - name: Check if today is a release day
         id: check_day
+        shell: bash
         run: |
           SEED=$(date +%Y%m)
           DAY1=$(( (SEED % 14) + 1 ))
@@ -32,9 +33,14 @@ jobs:
       - name: Generate Dynamic Version Tag
         if: github.event_name == 'workflow_dispatch' || steps.check_day.outputs.match == 'true'
         id: tag
+        shell: bash
         run: |
           # Letzten Tag suchen, der dem Schema vX.X.X entspricht
-          LATEST_TAG=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || echo "v1.0.0")
+          LATEST_TAG=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+          
+          if [ -z "$LATEST_TAG" ]; then
+            LATEST_TAG="v1.0.0"
+          fi
           
           # Extrahiere Major.Minor.Patch (z.B. 1.0.0)
           VERSION_BASE=$(echo $LATEST_TAG | sed 's/v//' | cut -d. -f1,2,3)
@@ -52,7 +58,14 @@ jobs:
 
       - name: Create ZIP of Scripts
         if: github.event_name == 'workflow_dispatch' || steps.check_day.outputs.match == 'true'
-        run: zip -r smarthome_scripts_${{ steps.tag.outputs.tag_name }}.zip iobroker/
+        shell: bash
+        run: |
+          if [ -d "iobroker" ]; then
+            zip -r smarthome_scripts_${{ steps.tag.outputs.tag_name }}.zip iobroker/
+          else
+            echo "Error: iobroker directory not found!"
+            exit 1
+          fi
 
       - name: Create GitHub Release
         if: github.event_name == 'workflow_dispatch' || steps.check_day.outputs.match == 'true'
@@ -61,6 +74,6 @@ jobs:
           tag_name: ${{ steps.tag.outputs.tag_name }}
           name: Automated Snapshot ${{ steps.tag.outputs.tag_name }}
           body: |
-            Automated snapshot of productive smarthome system scripts.
+            Automated snapshot of different productive smarthome systems scripts.
             Version incremented automatically.
           files: smarthome_scripts_${{ steps.tag.outputs.tag_name }}.zip
