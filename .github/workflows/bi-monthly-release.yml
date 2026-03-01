@@ -1,4 +1,4 @@
-name: Multi Monthly Release
+name: Bi-Monthly Random Release
 
 on:
   schedule:
@@ -30,7 +30,7 @@ jobs:
           fi
 
       - name: Generate Dynamic Version Tag
-        if: steps.check_day.outputs.match == 'true'
+        if: github.event_name == 'workflow_dispatch' || steps.check_day.outputs.match == 'true'
         id: tag
         run: |
           # Letzten Tag suchen, der dem Schema vX.X.X entspricht
@@ -51,16 +51,16 @@ jobs:
           echo "tag_name=$FINAL_TAG" >> $GITHUB_OUTPUT
 
       - name: Create ZIP of Scripts
-        if: steps.check_day.outputs.match == 'true'
+        if: github.event_name == 'workflow_dispatch' || steps.check_day.outputs.match == 'true'
         run: zip -r smarthome_scripts_${{ steps.tag.outputs.tag_name }}.zip iobroker/
 
       - name: Create GitHub Release
-        if: steps.check_day.outputs.match == 'true'
+        if: github.event_name == 'workflow_dispatch' || steps.check_day.outputs.match == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag_name }}
           name: Automated Snapshot ${{ steps.tag.outputs.tag_name }}
           body: |
-            Bi-monthly automated snapshot of productive ioBroker scripts.
+            Automated snapshot of productive smarthome system scripts.
             Version incremented automatically.
           files: smarthome_scripts_${{ steps.tag.outputs.tag_name }}.zip
