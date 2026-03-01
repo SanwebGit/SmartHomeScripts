@@ -72,7 +72,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag_name }}
-          name: Automated Snapshot ${{ steps.tag.outputs.tag_name }}
+          name: Snapshot ${{ steps.tag.outputs.tag_name }}
           body: |
             Automated snapshot of different productive smarthome system scripts.
             Version incremented automatically.
