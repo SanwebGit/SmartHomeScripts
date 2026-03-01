@@ -74,6 +74,5 @@ jobs:
           tag_name: ${{ steps.tag.outputs.tag_name }}
           name: Snapshot ${{ steps.tag.outputs.tag_name }}
           body: |
-            Automated snapshot of different productive smarthome system scripts.
-            Version incremented automatically.
+            Snapshot of different productive smarthome systems (iobroker/homematic/homeassistant) scripts.
           files: smarthome_scripts_${{ steps.tag.outputs.tag_name }}.zip
