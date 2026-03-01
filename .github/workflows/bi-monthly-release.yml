@@ -35,8 +35,8 @@ jobs:
         id: tag
         shell: bash
         run: |
-          # Letzten Tag suchen, der dem Schema vX.X.X entspricht
-          LATEST_TAG=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+          # Letzten Tag suchen, der dem Schema vX.X.X entspricht (|| true verhindert Abbruch, wenn kein Tag existiert)
+          LATEST_TAG=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || true)
           
           if [ -z "$LATEST_TAG" ]; then
             LATEST_TAG="v1.0.0"
@@ -74,6 +74,6 @@ jobs:
           tag_name: ${{ steps.tag.outputs.tag_name }}
           name: Automated Snapshot ${{ steps.tag.outputs.tag_name }}
           body: |
-            Automated snapshot of different productive smarthome systems scripts.
+            Automated snapshot of different productive smarthome system scripts.
             Version incremented automatically.
           files: smarthome_scripts_${{ steps.tag.outputs.tag_name }}.zip
