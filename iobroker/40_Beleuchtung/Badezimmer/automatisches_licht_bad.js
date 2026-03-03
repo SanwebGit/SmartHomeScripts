@@ -26,15 +26,15 @@ const CONFIG = {
             'zigbee2mqtt.0.0xa4c138f24bb238a3.presence'
         ],
         // Zusatzbedingung (z.B. Helligkeit, Systemvariable oder ein anderer Aktor)
-        condition: 'hm-rpc.0.003A20C99025DB.1.STATE',
+        condition: 'hm-rpc.0.003A20C99025DB.1.STATE',  //Sensor Badezimmerfenster
         conditionExpectedValue: 0
     },
     actors: {
-        target: 'hm-rpc.0.003AE0C9AD4F01.4.STATE'
+        target: 'hm-rpc.0.003AE0C9AD4F01.4.STATE' // zu schaltender Aktor
     },
     settings: {
         // 'true' = Licht bleibt an, solange MINDESTENS EIN Melder Präsenz zeigt.
-        // 'false' = (Original Blockly Verhalten) Licht geht aus, sobald EIN Melder 'false' meldet.
+        // 'false' = Licht geht aus, sobald EIN Melder 'false' meldet.
         useMultiSensorLogic: true 
     }
 };
@@ -70,7 +70,7 @@ function initPresenceControl() {
         // 2. Auswerten der Präsenz (abhängig von den Einstellungen)
         let isPresence = false;
         if (CONFIG.settings.useMultiSensorLogic) {
-            // Next-Level: Ist *irgendein* Melder aktiv?
+            // Ist *irgendein* Melder aktiv?
             isPresence = isAnyPresenceActive();
         } else {
             // Nimmt stur den Wert des Melders, der gerade ausgelöst hat
