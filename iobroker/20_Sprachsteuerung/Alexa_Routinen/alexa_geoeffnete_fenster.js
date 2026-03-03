@@ -1,5 +1,5 @@
 /*
- * @author      Ihr Name / Pseudonym
+ * @author      Sanweb
  * @version     1.7
  * @date        24.09.2025
  * @description Dieses Skript prüft auf Anfrage via Alexa, welche Fenster geöffnet sind
