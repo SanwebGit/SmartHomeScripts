@@ -2,7 +2,7 @@
 /**
  * @fileoverview Heizungs-Stratege (Wissen abrufen)
  * @version 1.7 - Typ-sicher
- * @author Sanweb / Gemini
+ * @author Sanweb
  * @license MIT
  *
  * Ruft basierend auf der aktuellen Situation die passende gelernte Erfahrung

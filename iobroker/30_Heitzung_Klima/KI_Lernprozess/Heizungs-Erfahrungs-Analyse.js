@@ -2,7 +2,7 @@
 /**
  * @fileoverview Heizungs-Lerner (Schritt 3: Alle Räume & Kontexte)
  * @version 3.5 - Pushover Edition
- * @author Sanweb / Gemini
+ * @author Sanweb
  * @license MIT
  *
  * Finale Version des neuen Lern-Skripts.
