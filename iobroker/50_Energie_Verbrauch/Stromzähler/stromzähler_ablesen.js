@@ -5,7 +5,7 @@
  * Stromverbrauchsdaten (Tages-, Wochen-, Monats- und Jahreswerte).
  * Liest Daten eines Zigbee-Sensors, erkennt Sensor-Resets und 
  * gleicht diese über einen dynamischen Offset automatisch ab.
- * @version     1.7.0 (Zählerwechsel-Feature)
+ * @version     1.7.1 (Initial Run Zigbee-Offset Kompensation)
  * @date        2026-03-04
  * @author      Sanweb
  * =============================================================================
@@ -249,8 +249,13 @@ class StromZaehlerManager {
             const initialEnergy = await getStateAsync(this.config.sources.energy);
             
             if (initialEnergy && typeof initialEnergy.val === "number") {
-                let geraeteOffset = this.holeWert("Strom_Geraete_Offset") || 0;
                 let zaehlerStartOffset = this.holeWert("Strom_Zaehler_Startoffset") || 0;
+                
+                // NEU: Wir kompensieren den internen Speicher des Zigbee-Sensors beim Erst-Start!
+                // Dadurch entspricht der Live-Zählerstand exakt dem eingetragenen Startoffset.
+                let geraeteOffset = Utils.rundenKwh(-initialEnergy.val);
+                await this.schreibeWertAsync("Strom_Geraete_Offset", geraeteOffset);
+                
                 let calcZaehlerstand = Utils.rundenKwh(initialEnergy.val + zaehlerStartOffset + geraeteOffset);
                 
                 await this.schreibeWertAsync("Strom_Referenz_heute", calcZaehlerstand);
