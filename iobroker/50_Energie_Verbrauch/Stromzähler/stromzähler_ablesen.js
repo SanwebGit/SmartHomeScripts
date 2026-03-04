@@ -75,7 +75,7 @@ const DATENPUNKTE = [
     { id: "Strom_Verbrauch_letzte_Woche", name: "Strom Verbrauch letzte Woche", type: "number", role: "value.energy", unit: "kWh" },
     { id: "Strom_Verbrauch_Monat", name: "Strom Verbrauch Monat", type: "number", role: "value.energy", unit: "kWh" },
     { id: "Strom_Verbrauch_Woche", name: "Strom Verbrauch Woche", type: "number", role: "value.energy", unit: "kWh" },
-    { id: "Strom_Zaehlerstand", name: "Strom Zaehlerstand", type: "number", role: "value.energy", unit: "kWh" },
+    { id: "Strom_Zaehlerstand", name: "Strom: Aktueller Zählerstand (Live)", desc: "Berechneter aktueller Zählerstand (Fester Startwert + gemessener Verbrauch)", type: "number", role: "value.energy", unit: "kWh" },
     { id: "Strom_Geraete_Offset", name: "Strom Geräte Offset", type: "number", role: "value.energy", unit: "kWh" },
     { id: "Strom_Letzter_Rohwert", name: "Strom Letzter Rohwert", type: "number", role: "value.energy", unit: "kWh" },
     { id: "Strom_Ablesung_Trigger", name: "Strom Ablesung auslösen", type: "boolean", role: "button", unit: "", def: false },
@@ -84,7 +84,7 @@ const DATENPUNKTE = [
     { id: "Strom_Datum_Batterietausch", name: "Strom Datum Batterietausch", type: "string", role: "text", unit: "", def: "" },
     
     // NEU: Datenpunkte für den Zählerwechsel
-    { id: "Strom_Zaehler_Startoffset", name: "Strom Zähler Startoffset", type: "number", role: "value.energy", unit: "kWh", def: 9863 },
+    { id: "Strom_Zaehler_Startoffset", name: "Zählerwechsel: Fester Startwert (Basis)", desc: "Physischer Zählerstand bei Erstinstallation oder Zählerwechsel. Ändert sich nicht automatisch.", type: "number", role: "value.energy", unit: "kWh", def: 9863 },
     { id: "Strom_Zaehlerwechsel_Neuer_Wert", name: "Zählerwechsel: Neuer Zählerstand", type: "number", role: "value.energy", unit: "kWh", def: 0 },
     { id: "Strom_Zaehlerwechsel_Trigger", name: "Zählerwechsel: Auslösen", type: "boolean", role: "button", unit: "", def: false },
 
