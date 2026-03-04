@@ -20,7 +20,7 @@ const DP_KLINGEL = 'hm-rpc.0.0026E0C998D1F2.1.STATE';
 
 // Datenpunkt der Zutrittskontrolle (Boolean erwartet: true = gewährt, false = verweigert)
 // Falls du eine Werteliste nutzt, muss die Abfrage weiter unten angepasst werden.
-const DP_ZUTRITTSKONTROLLE = '0_userdata.0.Status.Haustuer.Zutrittskontrolle_Haustuer';
+const DP_ZUTRITTSKONTROLLE = '0_userdata.0.Haustuer.Zutrittskontrolle_Haustuer';
 
 // Datenpunkt zum Speichern des letzten Klingelzeitpunkts (Typ: Number/Zahl)
 const DP_LAST_RING = '0_userdata.0.Status.Klingel_LastRingTime';
