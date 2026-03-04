@@ -2,25 +2,39 @@
 ================================================================================
 Anwesenheitsskript für ioBroker
 ================================================================================
- * Author:         Sanweb (Optimiert)
- * Version:        2.5.0 (Performance Edition)
+ * Author:         Sanweb
+ * Version:        3.0.0 (Masterpiece)
  * Erstellt am:    04.03.2026
  *
  * Beschreibung:
  * Dieses Skript überwacht den Anwesenheitsstatus von mehreren Geräten.
  * Es ist modular, robust und extrem performant dank Batching und Caching.
  *
- * Neue Features in 2.5.0:
- * - Parallele Cache-Befüllung beim Start (massiver Geschwindigkeitsboost)
- * - Gezielte Cache-Invalidierung bei echten Events
- * - Dynamische Batch-Zeit Anpassung bei Update-Stürmen
- * - Defekt-Markierung für fehlerhafte Datenpunkte
-================================================================================
+ * ===========================================================================
+ * DYNAMISCHE KONFIGURATION (für Administratoren)
+ * ===========================================================================
+ * * Sie können zusätzliche Geräte über einen Datenpunkt hinzufügen, ohne das
+ * Skript bearbeiten zu müssen. Das Skript erkennt Änderungen sofort!
+ * * Datenpunkt: 0_userdata.0.Anwesenheit.Config.devices
+ * Typ: JSON-String
+ * * Beispiel für JSON-Inhalt:
+ * [
+ * {
+ * "name": "Besucher",
+ * "devicePaths": ["tr-064.0.devices.gast-handy.active"]
+ * },
+ * {
+ * "name": "Putzkraft",
+ * "devicePaths": ["hm-rega.0.53758", "ble.0.tag-putzkraft"]
+ * }
+ * ]
+ * * Wichtig: Die Namen müssen eindeutig sein (keine Duplikate mit statischen!)
+ * ===========================================================================
 */
 
 (async () => { // Start der Kapselung
     "use strict";
-    
+
     // ============================================================================
     // 1. KONFIGURATION
     // ============================================================================
@@ -30,10 +44,16 @@ Anwesenheitsskript für ioBroker
     const TIMEOUT_MS = 5000; // Timeout für ioBroker Async-Aufrufe
     const MAX_HISTORY_ENTRIES = 10; // Maximale Anzahl an Historien-Einträgen pro Person
     const WATCHDOG_INTERVAL_MS = 3600000; // 1 Stunde: Prüft auf gelöschte Datenpunkte
+    const MAX_WINDOW_MS = 60000; // 1 Minute Fenster für die Update-Metriken
 
-    // Tragen Sie hier alle zu überwachenden Personen ein. 
-    // Nutzen Sie 'devicePaths' (Array) für mehrere Geräte (ODER-verknüpft).
-    const devices = [
+    /**
+     * @typedef {Object} DeviceConfig
+     * @property {string} name - Name der Person
+     * @property {string[]} devicePaths - Array der zu überwachenden ioBroker-Datenpunkte (ODER-verknüpft)
+     */
+
+    /** @type {DeviceConfig[]} */
+    let devices = [ // 'let' statt 'const' für dynamische Reloads
         {
             name: "Alex",
             devicePaths: ["hm-rega.0.53756"] 
@@ -56,20 +76,24 @@ Anwesenheitsskript für ioBroker
     const GLOBAL_STATUS_TEXT_PATH = BASE_PATH + "StatusGesamt";
     const WARTUNGSMODUS_PATH = BASE_PATH + "Wartungsmodus";
     const STATS_PATH = BASE_PATH + "Statistiken_Updates";
+    const DYNAMIC_CONFIG_PATH = BASE_PATH + "Config.devices"; // Für externe JSON Config
 
     // Laufzeit-Variablen
     const presenceCache = {};    // Speichert den aktuellen Status pro Person
     const debounceTimers = {};   // Speichert die Timeout-Objekte fürs Geräte-Debouncing
     const clusterCache = {};     // Kurzzeit-Cache für Cluster-Abfragen
     const defectiveStates = new Set(); // Speichert unwiederbringlich defekte Datenpunkte
+    const updateTimestamps = []; // Rolling Window Array für Metriken
     
     let globalEvalTimer = null;  // Timer für das Batching der globalen Auswertung
     let lastGlobalStatus = null; // Für optimiertes Logging
-    let subscriptions = [];      // Für sauberes Cleanup
+    let subscriptions = [];      // Für sauberes Cleanup allgemeiner Trigger
+    let deviceSubscription = null; // Spezieller Trigger für Geräte (wird bei Reload erneuert)
+    
     let updateCounter = 0;       // Metrik: Anzahl der Status-Updates gesamt
-    let recentUpdates = 0;       // Metrik: Updates in der letzten Minute (für dyn. Batching)
     let watchdogTimer = null;    // Timer für den stündlichen System-Check
-    let resetTimer = null;       // Timer für den Reset der recentUpdates
+    let watchdogOffset = 0;      // Offset für deterministisch rotierende Stichproben
+    let staticDeviceCount = 0;   // Merkt sich die Anzahl der fest codierten Geräte
 
     // ============================================================================
     // 3. HILFSFUNKTIONEN
@@ -126,16 +150,55 @@ Anwesenheitsskript für ioBroker
             if (device.devicePath && (!device.devicePaths || device.devicePaths.length === 0)) {
                 log(`[Info] Konvertiere legacy devicePath für ${device.name} zu devicePaths Array.`, "info");
                 device.devicePaths = [device.devicePath];
-                delete device.devicePath; // Bereinigen
+                delete device.devicePath; 
             }
         });
     }
 
     /**
-     * Validiert die Konfiguration beim Start
+     * Lädt optionale zusätzliche Gerätekonfigurationen aus einem Datenpunkt
+     */
+    async function loadDynamicConfig() {
+        debugLog("Prüfe auf dynamische Konfiguration...");
+        try {
+            if (!(await asyncWithRetry(() => existsStateAsync(DYNAMIC_CONFIG_PATH)))) {
+                await asyncWithRetry(() => createStateAsync(DYNAMIC_CONFIG_PATH, "[]", {
+                    name: "Dynamische Geräte-Konfiguration (JSON)",
+                    type: "string", role: "json", read: true, write: true, def: "[]"
+                }));
+                debugLog("Leerer dynamischer Konfigurations-Datenpunkt erstellt.");
+            }
+
+            const configState = await asyncWithRetry(() => getStateAsync(DYNAMIC_CONFIG_PATH));
+            if (configState && configState.val && configState.val !== "[]") {
+                try {
+                    const configDevices = JSON.parse(configState.val);
+                    if (Array.isArray(configDevices) && configDevices.length > 0) {
+                        debugLog(`${configDevices.length} Geräte aus dynamischer Konfiguration geladen.`);
+                        
+                        configDevices.forEach(device => {
+                            if (device.devicePath && (!device.devicePaths || device.devicePaths.length === 0)) {
+                                device.devicePaths = [device.devicePath];
+                                delete device.devicePath;
+                            }
+                        });
+                        
+                        devices.push(...configDevices);
+                    }
+                } catch (e) {
+                    log(`[Warnung] Dynamische Konfiguration konnte nicht geparst werden: ${e.message}`, "warn");
+                }
+            }
+        } catch (e) {
+            debugLog(`Fehler beim Laden der dynamischen Konfiguration: ${e.message}`);
+        }
+    }
+
+    /**
+     * Validiert die Konfiguration und prüft auf Duplikate
      */
     function validateConfig() {
-        debugLog("Validiere Konfiguration...");
+        debugLog("Validiere finale Konfiguration...");
         if (!devices || devices.length === 0) {
             throw new Error("Konfiguration leer! Es müssen 'devices' definiert werden.");
         }
@@ -153,6 +216,28 @@ Anwesenheitsskript für ioBroker
         debugLog("Konfiguration erfolgreich validiert.");
     }
 
+    /**
+     * Bereinigt alte Einträge und gibt die Anzahl der Updates der letzten Minute zurück
+     */
+    function getRecentUpdateCount() {
+        const now = Date.now();
+        while (updateTimestamps.length > 0 && now - updateTimestamps[0] > MAX_WINDOW_MS) {
+            updateTimestamps.shift();
+        }
+        return updateTimestamps.length;
+    }
+
+    /**
+     * Fügt einen neuen Update-Zeitstempel hinzu (Rolling Window mit OOM-Schutz)
+     */
+    function recordUpdate() {
+        updateTimestamps.push(Date.now());
+        if (updateTimestamps.length > 1000) {
+            updateTimestamps.splice(0, 500); 
+        }
+        return getRecentUpdateCount();
+    }
+
     // ============================================================================
     // 4. DATENPUNKTE & WATCHDOG
     // ============================================================================
@@ -161,7 +246,7 @@ Anwesenheitsskript für ioBroker
      * Erstellt Datenpunkte mit Retry und merkt sich hartnäckige Fehler
      */
     async function safeCreateState(path, def, commonConfig) {
-        if (defectiveStates.has(path)) return; // Ignoriere bekannte defekte DP
+        if (defectiveStates.has(path)) return; 
 
         try {
             if (!(await asyncWithRetry(() => existsStateAsync(path)))) {
@@ -170,7 +255,7 @@ Anwesenheitsskript für ioBroker
             }
         } catch (e) {
             log(`[Warnung] Konnte Datenpunkt ${path} nach Retries nicht erstellen. Markiere als defekt: ${e.message}`, "warn");
-            defectiveStates.add(path); // Fehlertoleranz erhöhen (Punkt 9)
+            defectiveStates.add(path); 
         }
     }
 
@@ -191,12 +276,34 @@ Anwesenheitsskript für ioBroker
     }
 
     /**
-     * Prüft regelmäßig ob Quelldatenpunkte oder eigene Datenpunkte gelöscht wurden (Ressourcen-schonend)
+     * Prüft, ob defekte Datenpunkte wieder verfügbar sind
+     */
+    async function revalidateDefectiveStates() {
+        if (defectiveStates.size === 0) return;
+        debugLog("Revalidiere defekte Datenpunkte...");
+        
+        const toRevalidate = Array.from(defectiveStates);
+        for (const path of toRevalidate) {
+            try {
+                if (await asyncWithTimeout(existsStateAsync(path), 2000)) {
+                    defectiveStates.delete(path);
+                    debugLog(`Defekter Datenpunkt ${path} wurde revalidiert und ist wieder verfügbar.`);
+                }
+            } catch (e) {
+                // Bleibt weiterhin als defekt markiert
+            }
+        }
+    }
+
+    /**
+     * Prüft regelmäßig ob Quelldatenpunkte oder eigene Datenpunkte gelöscht wurden
      */
     async function runWatchdog() {
         debugLog("Watchdog-Lauf: Prüfe Systemintegrität...");
 
-        // Cluster-Cache bereinigen (verhindert Altlasten, falls sich Namen ändern)
+        getRecentUpdateCount(); 
+        await revalidateDefectiveStates(); 
+
         const now = Date.now();
         for (const person in clusterCache) {
             if (now - clusterCache[person].lastCheck > 60000) {
@@ -204,16 +311,24 @@ Anwesenheitsskript für ioBroker
             }
         }
 
+        // Deterministisch rotierende Stichprobe (ca. 20%) prüfen
+        const sampleSize = Math.max(1, Math.floor(devices.length * 0.2));
+        const sampledDevices = [];
+        for (let i = 0; i < sampleSize; i++) {
+            sampledDevices.push(devices[(watchdogOffset + i) % devices.length]);
+        }
+        watchdogOffset = (watchdogOffset + sampleSize) % devices.length;
+
         // 1. Eigene Datenpunkte stichprobenartig prüfen
         let needsRestore = false;
-        for (const device of devices) {
+        for (const device of sampledDevices) {
             const checkPaths = [
                 `${BASE_PATH}${device.name}`,
                 `${BASE_PATH}${device.name}_ZuletztGesehen`
             ];
             
             for (const path of checkPaths) {
-                if (defectiveStates.has(path)) continue; // Defekte überspringen
+                if (defectiveStates.has(path)) continue; 
                 try {
                     if (!(await asyncWithRetry(() => existsStateAsync(path), 2, 500))) {
                         needsRestore = true;
@@ -231,8 +346,8 @@ Anwesenheitsskript für ioBroker
             await setupDataPoints();
         }
 
-        // 2. Quelldatenpunkte prüfen
-        for (const device of devices) {
+        // 2. Quelldatenpunkte prüfen (ebenfalls rotierende Stichprobe)
+        for (const device of sampledDevices) {
             for (const path of device.devicePaths) {
                 try {
                     const exists = await asyncWithRetry(() => existsStateAsync(path), 2, 500);
@@ -263,7 +378,7 @@ Anwesenheitsskript für ioBroker
                 } catch (e) {
                     debugLog(`Konnte Historie für ${personName} nicht parsen. Erstelle Backup.`);
                     await asyncWithRetry(() => setStateAsync(backupPath, historyState.val, true));
-                    history = []; // Neu beginnen
+                    history = []; 
                 }
             }
 
@@ -323,7 +438,9 @@ Anwesenheitsskript für ioBroker
             }
 
             if (updatePromises.length > 0) {
-                await Promise.all(updatePromises);
+                const results = await Promise.allSettled(updatePromises);
+                const failed = results.filter(r => r.status === 'rejected');
+                if (failed.length > 0) debugLog(`${failed.length} globale Status-Updates fehlgeschlagen.`);
             }
 
         } catch (error) {
@@ -335,15 +452,16 @@ Anwesenheitsskript für ioBroker
 
     /**
      * Bündelt globale Auswertungen, um Lastspitzen zu vermeiden (Batching)
-     * Inklusive dynamischer Anpassung bei Update-Stürmen (Punkt 10)
      */
     function triggerGlobalEvaluation() {
         if (globalEvalTimer) clearTimeout(globalEvalTimer);
         
         let currentBatchMs = GLOBAL_BATCH_MS;
-        if (recentUpdates > 20) { // Ab 20 Updates pro Minute drosseln wir
+        const recent = getRecentUpdateCount();
+        
+        if (recent > 20) { 
             currentBatchMs = Math.min(2000, GLOBAL_BATCH_MS * 2);
-            debugLog(`Hohe Systemlast erkannt (${recentUpdates} Updates/min). Batching auf ${currentBatchMs}ms erhöht.`);
+            debugLog(`Hohe Systemlast erkannt (${recent} Updates/min). Batching auf ${currentBatchMs}ms erhöht.`);
         }
 
         globalEvalTimer = setTimeout(async () => {
@@ -352,34 +470,22 @@ Anwesenheitsskript für ioBroker
     }
 
     /**
-     * Invalidiert den Cluster-Cache für eine Person bei echten Events (Punkt 6)
+     * Prüft alle Geräte einer Person. Parameter forceRefresh umgeht den Cache bei Events.
      */
-    function invalidateClusterCache(personName) {
-        if (clusterCache[personName]) {
-            clusterCache[personName].lastCheck = 0; // Erzwingt Neuladen beim nächsten Check
-            debugLog(`Cluster-Cache invalidiert für ${personName}`);
-        }
-    }
-
-    /**
-     * Prüft alle Geräte einer Person (inkl. 5-Sekunden Performance-Cache für Cluster)
-     */
-    async function checkPersonClusterStatus(deviceConfig) {
+    async function checkPersonClusterStatus(deviceConfig, forceRefresh = false) {
         const cacheKey = deviceConfig.name;
         const now = Date.now();
         
-        // Cache nutzen, sofern jünger als 5 Sekunden
-        if (clusterCache[cacheKey] && (now - clusterCache[cacheKey].lastCheck < 5000)) {
+        if (!forceRefresh && clusterCache[cacheKey] && (now - clusterCache[cacheKey].lastCheck < 5000)) {
             return clusterCache[cacheKey].status;
         }
 
-        // Normale Abfrage bei abgelaufenem/invalidiertem Cache
         for (const path of deviceConfig.devicePaths) {
             try {
                 const sourceState = await asyncWithRetry(() => getStateAsync(path));
                 if (parsePresenceValue(sourceState ? sourceState.val : null)) {
                     clusterCache[cacheKey] = { status: true, lastCheck: now };
-                    return true; // Eines online reicht
+                    return true; 
                 }
             } catch (e) {
                 debugLog(`Fehler beim Cluster-Check für ${path}: ${e.message}`);
@@ -410,15 +516,18 @@ Anwesenheitsskript für ioBroker
                 updates.push(asyncWithRetry(() => setStateAsync(lastSeenPath, timestamp, true)));
             }
 
-            // Metriken hochzählen
             updateCounter++;
-            recentUpdates++;
+            recordUpdate(); 
             if (!defectiveStates.has(STATS_PATH)) updates.push(asyncWithRetry(() => setStateAsync(STATS_PATH, updateCounter, true)));
 
-            // Warten bis Datenpunkte geschrieben sind
-            await Promise.all(updates);
+            const results = await Promise.allSettled(updates);
+            const failed = results.filter(r => r.status === 'rejected');
             
-            // Erst jetzt Cache updaten
+            if (failed.length > 0) {
+                log(`[Hm-Rega] ${failed.length} ioBroker Updates für ${device.name} fehlgeschlagen. Cache wird sicherheitshalber nicht aktualisiert.`, "warn");
+                return; 
+            }
+            
             presenceCache[device.name] = isPresent;
             
             await updateHistory(device.name, isPresent, timestamp);
@@ -431,7 +540,7 @@ Anwesenheitsskript für ioBroker
     }
 
     /**
-     * Initiale Datenbefüllung beim Start - Parallelisiert für Performance (Punkt 8)
+     * Initiale Datenbefüllung beim Start - Parallelisiert für Performance
      */
     async function populateInitialCache() {
         debugLog("Fülle initialen Status-Cache parallel...");
@@ -441,9 +550,8 @@ Anwesenheitsskript für ioBroker
             hour: '2-digit', minute: '2-digit', second: '2-digit'
         });
 
-        // Alle Personen gleichzeitig verarbeiten anstatt blockierend nacheinander
-        await Promise.all(devices.map(async (device) => {
-            const isPresent = await checkPersonClusterStatus(device);
+        await Promise.allSettled(devices.map(async (device) => {
+            const isPresent = await checkPersonClusterStatus(device, true);
             presenceCache[device.name] = isPresent;
             await updateHistory(device.name, isPresent, timestamp);
         }));
@@ -452,53 +560,18 @@ Anwesenheitsskript für ioBroker
     }
 
     // ============================================================================
-    // 6. CLEANUP & SKRIPT-START
+    // 6. INITIALISIERUNG & DYNAMISCHER RELOAD
     // ============================================================================
 
-    onStop(function (callback) {
-        debugLog("Skript wird gestoppt. Bereinige Ressourcen...");
-        
-        for (const timer in debounceTimers) {
-            if (debounceTimers[timer]) clearTimeout(debounceTimers[timer]);
+    /**
+     * Initialisiert alle Geräte-Trigger. Wird auch beim dynamischen Reload aufgerufen.
+     */
+    function setupDeviceSubscriptions() {
+        // Alten Trigger sauber beenden, falls vorhanden
+        if (deviceSubscription && typeof deviceSubscription.unsubscribe === 'function') {
+            deviceSubscription.unsubscribe();
         }
-        if (globalEvalTimer) clearTimeout(globalEvalTimer);
-        if (watchdogTimer) clearInterval(watchdogTimer);
-        if (resetTimer) clearInterval(resetTimer);
-        
-        // Sauberes Subscription Cleanup (nur valide Funktionen ausführen)
-        subscriptions.forEach(sub => {
-            try {
-                if (sub && typeof sub.unsubscribe === 'function') {
-                    sub.unsubscribe();
-                }
-            } catch (e) {
-                debugLog(`Fehler beim Unsubscribe: ${e.message}`);
-            }
-        });
-        
-        log("[Hm-Rega] Cleanup erfolgreich beendet.");
-        callback();
-    });
 
-    try {
-        log("[Hm-Rega] Skript wird gestartet (v2.5.0 Performance Edition)...");
-
-        normalizeConfig(); // Abwärtskompatibilität herstellen
-        validateConfig();
-        await setupDataPoints();
-        await populateInitialCache();
-
-        // Metrik-Timer starten (setzt recentUpdates jede Minute zurück)
-        resetTimer = setInterval(() => { recentUpdates = 0; }, 60000);
-
-        // 1. Trigger für Wartungsmodus
-        const subWartung = on({ id: WARTUNGSMODUS_PATH, change: "ne" }, (obj) => {
-            debugLog(`Wartungsmodus geändert auf: ${obj.state.val}`);
-            triggerGlobalEvaluation();
-        });
-        subscriptions.push(subWartung);
-
-        // 2. Trigger für alle Gerätepfade
         const allPaths = [];
         const pathToPersonMap = {};
         
@@ -509,14 +582,11 @@ Anwesenheitsskript für ioBroker
             });
         });
 
-        const subDevices = on({ id: allPaths, change: "ne" }, function (obj) {
+        deviceSubscription = on({ id: allPaths, change: "ne" }, function (obj) {
             const device = pathToPersonMap[obj.id];
             if (!device) return;
 
             debugLog(`Rohwert-Änderung bei '${obj.id}' erkannt.`);
-            
-            // Direkte Cache-Invalidierung für dieses Event
-            invalidateClusterCache(device.name);
 
             if (debounceTimers[device.name]) {
                 clearTimeout(debounceTimers[device.name]);
@@ -524,8 +594,7 @@ Anwesenheitsskript für ioBroker
 
             debounceTimers[device.name] = setTimeout(async () => {
                 try {
-                    // Erneuter Check inkl. Cluster-Logik & Caching
-                    const currentVal = await checkPersonClusterStatus(device);
+                    const currentVal = await checkPersonClusterStatus(device, true);
                     
                     if (presenceCache[device.name] !== currentVal) {
                         await processDeviceChange(device, currentVal);
@@ -535,12 +604,88 @@ Anwesenheitsskript für ioBroker
                 }
             }, DEBOUNCE_MS);
         });
-        subscriptions.push(subDevices);
+    }
+
+    /**
+     * Führt den kompletten Setup-Prozess durch (beim Start und bei Config-Änderungen)
+     */
+    async function bootSystem() {
+        try {
+            // Statische Geräte wiederherstellen (dynamische entfernen)
+            devices.splice(staticDeviceCount); 
+            
+            normalizeConfig(); 
+            await loadDynamicConfig(); 
+            validateConfig();
+            
+            await setupDataPoints();
+            await populateInitialCache();
+            setupDeviceSubscriptions();
+        } catch (e) {
+            log(`[Hm-Rega] Fehler während des System-Starts/Reloads: ${e.message}`, "error");
+        }
+    }
+
+
+    // ============================================================================
+    // 7. CLEANUP & SKRIPT-START
+    // ============================================================================
+
+    onStop(function (callback) {
+        debugLog("Skript wird gestoppt. Bereinige Ressourcen...");
+        
+        for (const timer in debounceTimers) {
+            if (debounceTimers[timer]) clearTimeout(debounceTimers[timer]);
+        }
+        if (globalEvalTimer) clearTimeout(globalEvalTimer);
+        if (watchdogTimer) clearInterval(watchdogTimer);
+        updateTimestamps.length = 0; 
+        
+        subscriptions.forEach(sub => {
+            try {
+                if (sub && typeof sub.unsubscribe === 'function') {
+                    sub.unsubscribe();
+                }
+            } catch (e) {
+                debugLog(`Fehler beim Unsubscribe: ${e.message}`);
+            }
+        });
+
+        if (deviceSubscription && typeof deviceSubscription.unsubscribe === 'function') {
+            deviceSubscription.unsubscribe();
+        }
+        
+        log("[Hm-Rega] Cleanup erfolgreich beendet.");
+        callback();
+    });
+
+    try {
+        log("[Hm-Rega] Skript wird gestartet (v3.0.0 Masterpiece)...");
+
+        // Merke die Anzahl der statisch im Code hinterlegten Geräte
+        staticDeviceCount = devices.length;
+
+        // Führe initialen Start aus
+        await bootSystem();
+
+        // 1. Trigger für Wartungsmodus
+        const subWartung = on({ id: WARTUNGSMODUS_PATH, change: "ne" }, (obj) => {
+            debugLog(`Wartungsmodus geändert auf: ${obj.state.val}`);
+            triggerGlobalEvaluation();
+        });
+        subscriptions.push(subWartung);
+
+        // 2. Trigger für dynamische Konfigurations-Updates (Live-Reload)
+        const subConfig = on({ id: DYNAMIC_CONFIG_PATH, change: "ne" }, async () => {
+            log("[Hm-Rega] Änderung der dynamischen Konfiguration erkannt. Lade System live neu...", "info");
+            await bootSystem();
+        });
+        subscriptions.push(subConfig);
 
         // 3. Watchdog Timer aktivieren
         watchdogTimer = setInterval(runWatchdog, WATCHDOG_INTERVAL_MS);
 
-        log(`[Hm-Rega] Überwachung gestartet für: ${devices.map(d => d.name).join(', ')}.`);
+        log(`[Hm-Rega] System erfolgreich initialisiert. Überwache ${devices.length} Personen.`);
 
     } catch (error) {
         log(`[Hm-Rega] Kritischer Fehler beim Skript-Start. Skript abgebrochen: ${error.message}`, "error");
