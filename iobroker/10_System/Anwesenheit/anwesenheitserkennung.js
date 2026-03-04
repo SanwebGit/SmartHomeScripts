@@ -3,7 +3,7 @@
 Anwesenheitsskript für ioBroker
 ================================================================================
  * Author:         Sanweb
- * Version:        3.0.0 (Masterpiece)
+ * Version:        3.0.1 (Masterpiece - Syntax Fix)
  * Erstellt am:    04.03.2026
  *
  * Beschreibung:
@@ -49,7 +49,8 @@ Anwesenheitsskript für ioBroker
     /**
      * @typedef {Object} DeviceConfig
      * @property {string} name - Name der Person
-     * @property {string[]} devicePaths - Array der zu überwachenden ioBroker-Datenpunkte (ODER-verknüpft)
+     * @property {string[]} [devicePaths] - Array der zu überwachenden ioBroker-Datenpunkte (ODER-verknüpft)
+     * @property {string} [devicePath] - Veraltet: Einzelner Datenpunkt (für Abwärtskompatibilität)
      */
 
     /** @type {DeviceConfig[]} */
@@ -576,10 +577,12 @@ Anwesenheitsskript für ioBroker
         const pathToPersonMap = {};
         
         devices.forEach(d => {
-            d.devicePaths.forEach(path => {
-                allPaths.push(path);
-                pathToPersonMap[path] = d;
-            });
+            if (d.devicePaths) {
+                d.devicePaths.forEach(path => {
+                    allPaths.push(path);
+                    pathToPersonMap[path] = d;
+                });
+            }
         });
 
         deviceSubscription = on({ id: allPaths, change: "ne" }, function (obj) {
@@ -660,7 +663,7 @@ Anwesenheitsskript für ioBroker
     });
 
     try {
-        log("[Hm-Rega] Skript wird gestartet (v3.0.0 Masterpiece)...");
+        log("[Hm-Rega] Skript wird gestartet (v3.0.1 Masterpiece - Syntax Fix)...");
 
         // Merke die Anzahl der statisch im Code hinterlegten Geräte
         staticDeviceCount = devices.length;
