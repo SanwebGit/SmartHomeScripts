@@ -6,6 +6,7 @@
  * Autor:        Sanweb
  * * -----------------------------------------------------------------------------
  * Versionshistorie:
+ * v1.0.1  | 04.03.2026 | Auto-Create für fehlende Datenpunkte hinzugefügt
  * v1.0.0  | 04.03.2026 | Initiale Version
  *******************************************************************************/
 
@@ -91,7 +92,7 @@ function safeSetState(id, val) {
 }
 
 // ==============================================================================
-// INITIALISIERUNG
+// INITIALISIERUNG & AUTO-CREATE DATENPUNKTE
 // ==============================================================================
 
 // Plausibilitätsprüfung der konfigurierten Zeiten
@@ -108,24 +109,40 @@ if (!/^([01]\d|2[0-3]):([0-5]\d)$/.test(ALEXA_START_ZEIT) || !/^([01]\d|2[0-3]):
     }
 }
 
-// Wir prüfen nur, ob der Zutrittskontroll-Datenpunkt existiert. 
-// Manuelles Anlegen im ioBroker-Objektbaum wird empfohlen, um asynchrone Fehler durch createState zu vermeiden.
+// 1. Datenpunkt für die Zutrittskontrolle prüfen und ggf. anlegen
 if (!stateExists(DP_ZUTRITTSKONTROLLE)) {
-    log(`WICHTIG: Der Datenpunkt ${DP_ZUTRITTSKONTROLLE} existiert nicht. Bitte lege ihn manuell als Logikwert (boolean) an!`, 'error');
+    log(`Datenpunkt ${DP_ZUTRITTSKONTROLLE} existiert nicht. Wird automatisch angelegt...`, 'info');
+    await createStateAsync(DP_ZUTRITTSKONTROLLE, false, {
+        name: 'Zutrittskontrolle Haustür',
+        desc: 'Status der Zutrittskontrolle',
+        type: 'boolean',
+        role: 'indicator',
+        read: true,
+        write: true
+    });
 }
 
-// Letzten Klingel-Zeitpunkt laden, falls der Datenpunkt existiert
-if (stateExists(DP_LAST_RING)) {
-    const savedTime = getState(DP_LAST_RING).val;
-    if (typeof savedTime === 'number' && !isNaN(savedTime)) {
-        lastRingTime = savedTime;
-        logDebug(`Letzter Klingelzeitpunkt aus Datenpunkt geladen: ${lastRingTime}`);
-    } else {
-        log('WARNUNG: Gespeicherter Klingelzeitpunkt ist ungültig, verwende 0', 'warn');
-        lastRingTime = 0;
-    }
+// 2. Datenpunkt für den letzten Klingelzeitpunkt prüfen und ggf. anlegen
+if (!stateExists(DP_LAST_RING)) {
+    log(`Datenpunkt ${DP_LAST_RING} existiert nicht. Wird automatisch angelegt...`, 'info');
+    await createStateAsync(DP_LAST_RING, 0, {
+        name: 'Letzter Klingelzeitpunkt',
+        desc: 'Timestamp des letzten Klingelsignals in Millisekunden',
+        type: 'number',
+        role: 'value.time',
+        read: true,
+        write: true
+    });
+}
+
+// Letzten Klingel-Zeitpunkt laden (Datenpunkt existiert jetzt garantiert)
+const savedTime = getState(DP_LAST_RING).val;
+if (typeof savedTime === 'number' && !isNaN(savedTime)) {
+    lastRingTime = savedTime;
+    logDebug(`Letzter Klingelzeitpunkt aus Datenpunkt geladen: ${lastRingTime}`);
 } else {
-    log(`HINWEIS: Der Datenpunkt ${DP_LAST_RING} existiert nicht. Lege ihn als Zahl (number) an, um die Sturm-Protection über Skript-Neustarts hinweg zu erhalten.`, 'info');
+    log('WARNUNG: Gespeicherter Klingelzeitpunkt ist ungültig, verwende 0', 'warn');
+    lastRingTime = 0;
 }
 
 // ==============================================================================
