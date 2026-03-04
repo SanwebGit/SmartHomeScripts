@@ -24,7 +24,7 @@ const DP_KLINGEL = 'hm-rpc.0.0026E0C998D1F2.1.STATE';
 const DP_ZUTRITTSKONTROLLE = '0_userdata.0.Haustuer.Zutrittskontrolle_Haustuer';
 
 // Datenpunkt zum Speichern des letzten Klingelzeitpunkts (Typ: Number/Zahl)
-const DP_LAST_RING = '0_userdata.0.Status.Klingel_LastRingTime';
+const DP_LAST_RING = '0_userdata.0.Haustuer.Klingel_LastRingTime';
 
 // Datenpunkt für den HmIP-PCBS Haustürsummer (meist Kanal 3 oder 4, .STATE)
 const DP_TUERSUMMER = 'hm-rpc.0.00045A49A87CFF.3.STATE';
@@ -71,14 +71,9 @@ function isTimeInRange(startTime, endTime) {
     return currentMins >= startMins && currentMins < endMins;
 }
 
-// Prüft synchron und sicher, ob ein Datenpunkt im ioBroker existiert
-function stateExists(id) {
-    return typeof getObject(id) !== 'undefined';
-}
-
 // Sicheres Setzen von States mit Prüfung und Logging sowie Callback-Fehlerbehandlung
 function safeSetState(id, val) {
-    if (stateExists(id)) {
+    if (existsState(id)) {
         log(`Setze Datenpunkt "${id}" auf Wert: ${val}`, 'debug');
         // Hinweis zum ack-Flag:
         // Andere States hier nutzen ack=false (Steuerbefehle an Geräte).
@@ -110,7 +105,7 @@ if (!/^([01]\d|2[0-3]):([0-5]\d)$/.test(ALEXA_START_ZEIT) || !/^([01]\d|2[0-3]):
 }
 
 // 1. Datenpunkt für die Zutrittskontrolle prüfen und ggf. anlegen
-if (!stateExists(DP_ZUTRITTSKONTROLLE)) {
+if (!existsState(DP_ZUTRITTSKONTROLLE)) {
     log(`Datenpunkt ${DP_ZUTRITTSKONTROLLE} existiert nicht. Wird automatisch angelegt...`, 'info');
     await createStateAsync(DP_ZUTRITTSKONTROLLE, false, {
         name: 'Zutrittskontrolle Haustür',
@@ -123,7 +118,7 @@ if (!stateExists(DP_ZUTRITTSKONTROLLE)) {
 }
 
 // 2. Datenpunkt für den letzten Klingelzeitpunkt prüfen und ggf. anlegen
-if (!stateExists(DP_LAST_RING)) {
+if (!existsState(DP_LAST_RING)) {
     log(`Datenpunkt ${DP_LAST_RING} existiert nicht. Wird automatisch angelegt...`, 'info');
     await createStateAsync(DP_LAST_RING, 0, {
         name: 'Letzter Klingelzeitpunkt',
@@ -133,16 +128,17 @@ if (!stateExists(DP_LAST_RING)) {
         read: true,
         write: true
     });
-}
-
-// Letzten Klingel-Zeitpunkt laden (Datenpunkt existiert jetzt garantiert)
-const savedTime = getState(DP_LAST_RING).val;
-if (typeof savedTime === 'number' && !isNaN(savedTime)) {
-    lastRingTime = savedTime;
-    logDebug(`Letzter Klingelzeitpunkt aus Datenpunkt geladen: ${lastRingTime}`);
+    lastRingTime = 0; // Wert ist 0, da der Datenpunkt gerade erst angelegt wurde
 } else {
-    log('WARNUNG: Gespeicherter Klingelzeitpunkt ist ungültig, verwende 0', 'warn');
-    lastRingTime = 0;
+    // Letzten Klingel-Zeitpunkt laden (Datenpunkt existierte bereits)
+    const savedTime = getState(DP_LAST_RING).val;
+    if (typeof savedTime === 'number' && !isNaN(savedTime)) {
+        lastRingTime = savedTime;
+        logDebug(`Letzter Klingelzeitpunkt aus Datenpunkt geladen: ${lastRingTime}`);
+    } else {
+        log('WARNUNG: Gespeicherter Klingelzeitpunkt ist ungültig, verwende 0', 'warn');
+        lastRingTime = 0;
+    }
 }
 
 // ==============================================================================
@@ -163,7 +159,7 @@ on({id: DP_KLINGEL, val: true, ack: true}, function (obj) {
 
     // Klingelschutz aktivieren (Zeitstempel setzen)
     lastRingTime = now;
-    if (stateExists(DP_LAST_RING)) {
+    if (existsState(DP_LAST_RING)) {
         // Hinweis zum ack-Flag: ack=true, da wir hier nur einen Status im System protokollieren und nichts steuern
         setState(DP_LAST_RING, lastRingTime, true); 
     }
@@ -171,7 +167,7 @@ on({id: DP_KLINGEL, val: true, ack: true}, function (obj) {
 
     // Aktuellen Status der Zutrittskontrolle abrufen (Explizite Boolean-Prüfung)
     let zutrittGewaehrt = false;
-    if (stateExists(DP_ZUTRITTSKONTROLLE)) {
+    if (existsState(DP_ZUTRITTSKONTROLLE)) {
         zutrittGewaehrt = (getState(DP_ZUTRITTSKONTROLLE).val === true);
     }
 
@@ -219,7 +215,7 @@ onStop(function () {
         clearTimeout(timerTuersummer);
         timerTuersummer = null;
         // Sicherheitshalber den Summer ausschalten, falls er gerade an war
-        if (stateExists(DP_TUERSUMMER)) {
+        if (existsState(DP_TUERSUMMER)) {
             setState(DP_TUERSUMMER, false);
             log('Türsummer wegen Skript-Stopp sicherheitshalber ausgeschaltet.', 'info');
         }
