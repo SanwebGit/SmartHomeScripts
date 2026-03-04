@@ -5,7 +5,7 @@
  * Stromverbrauchsdaten (Tages-, Wochen-, Monats- und Jahreswerte).
  * Liest Daten eines Zigbee-Sensors, erkennt Sensor-Resets und 
  * gleicht diese über einen dynamischen Offset automatisch ab.
- * @version     1.6.0 (Enterprise Architecture, Caching, Batching & Metrics)
+ * @version     1.7.0 (Zählerwechsel-Feature)
  * @date        2026-03-04
  * @author      Sanweb
  * =============================================================================
@@ -16,7 +16,6 @@
  * @typedef {Object} Config
  * @property {string} basePath
  * @property {{energy: string, power: string}} sources
- * @property {number} startOffsetKwh
  * @property {number} maxZulaessigerSprungKwh
  * @property {number} minResetSchwelleKwh
  * @property {boolean} debug
@@ -43,8 +42,6 @@ const CONFIG = {
         power:  'zigbee2mqtt.0.0x0015bc001b10168f.load_power'   // Aktuelle Leistung in W
     },
     
-    // Start-Zählerstand deines physischen Zählers im Schaltschrank (in kWh)
-    startOffsetKwh: 9863,
 
     // Schwellwerte für die Validierung
     maxZulaessigerSprungKwh: 5.0, // Schützt vor utopischen Messfehlern
@@ -86,6 +83,11 @@ const DATENPUNKTE = [
     { id: "Strom_Letztes_Speicher_Datum", name: "Strom Letztes Speicher Datum", type: "string", role: "text", unit: "", def: "" },
     { id: "Strom_Datum_Batterietausch", name: "Strom Datum Batterietausch", type: "string", role: "text", unit: "", def: "" },
     
+    // NEU: Datenpunkte für den Zählerwechsel
+    { id: "Strom_Zaehler_Startoffset", name: "Strom Zähler Startoffset", type: "number", role: "value.energy", unit: "kWh", def: 9863 },
+    { id: "Strom_Zaehlerwechsel_Neuer_Wert", name: "Zählerwechsel: Neuer Zählerstand", type: "number", role: "value.energy", unit: "kWh", def: 0 },
+    { id: "Strom_Zaehlerwechsel_Trigger", name: "Zählerwechsel: Auslösen", type: "boolean", role: "button", unit: "", def: false },
+
     // Exportierte Health-Check & Monitoring Metriken
     { id: "Strom_Metriken_Updates_verarbeitet", name: "Metriken: Updates verarbeitet", type: "number", role: "value", unit: "", def: 0 },
     { id: "Strom_Metriken_Letztes_Update", name: "Metriken: Letztes Update", type: "string", role: "text", unit: "", def: "" },
@@ -184,7 +186,6 @@ class StromZaehlerManager {
 
     validiereConfig() {
         if (!this.config.basePath.endsWith('.')) throw new Error("Konfigurationsfehler: basePath muss mit einem Punkt '.' enden.");
-        if (this.config.startOffsetKwh < 0) throw new Error("Konfigurationsfehler: startOffsetKwh muss >= 0 sein.");
         if (this.config.maxZulaessigerSprungKwh <= 0) throw new Error("Konfigurationsfehler: maxZulaessigerSprungKwh muss > 0 sein.");
         if (!existsState(this.config.sources.energy)) throw new Error(`Quell-Datenpunkt für Energy (${this.config.sources.energy}) existiert nicht! Abbruch.`);
         if (!existsState(this.config.sources.power)) throw new Error(`Quell-Datenpunkt für Power (${this.config.sources.power}) existiert nicht! Abbruch.`);
@@ -249,7 +250,8 @@ class StromZaehlerManager {
             
             if (initialEnergy && typeof initialEnergy.val === "number") {
                 let geraeteOffset = this.holeWert("Strom_Geraete_Offset") || 0;
-                let calcZaehlerstand = Utils.rundenKwh(initialEnergy.val + this.config.startOffsetKwh + geraeteOffset);
+                let zaehlerStartOffset = this.holeWert("Strom_Zaehler_Startoffset") || 0;
+                let calcZaehlerstand = Utils.rundenKwh(initialEnergy.val + zaehlerStartOffset + geraeteOffset);
                 
                 await this.schreibeWertAsync("Strom_Referenz_heute", calcZaehlerstand);
                 await this.schreibeWertAsync("Strom_Referenz_Woche", calcZaehlerstand);
@@ -323,6 +325,14 @@ class StromZaehlerManager {
                 await this.fuehreManuelleAblesungAus();
             } catch (error) {
                 await this.handleError("Trigger: Manuelle Ablesung", error);
+            }
+        }));
+
+        this.subscriptions.push(on({ id: this.config.basePath + "Strom_Zaehlerwechsel_Trigger", change: "any", val: true }, async () => {
+            try {
+                await this.fuehreZaehlerwechselAus();
+            } catch (error) {
+                await this.handleError("Trigger: Zählerwechsel", error);
             }
         }));
     }
@@ -464,7 +474,8 @@ class StromZaehlerManager {
             await this.schreibeWertAsync("Strom_Letzter_Rohwert", neuerWertKwh);
 
             // 2. Gesamtzählerstand berechnen
-            let aktuellerZaehlerstand = Utils.rundenKwh(neuerWertKwh + this.config.startOffsetKwh + geraeteOffset);
+            let zaehlerStartOffset = await this.getStateCached(this.config.basePath + "Strom_Zaehler_Startoffset") ?? 0;
+            let aktuellerZaehlerstand = Utils.rundenKwh(neuerWertKwh + zaehlerStartOffset + geraeteOffset);
             
             // Plausibilitätsprüfung
             if (aktuellerZaehlerstand < 0) {
@@ -595,6 +606,65 @@ class StromZaehlerManager {
         await this.schreibeWertAsync("Strom_Verbrauch_letzte_Ablesung", 0);
         
         await this.schreibeWertAsync("Strom_Ablesung_Trigger", false, true);
+    }
+
+    async fuehreZaehlerwechselAus() {
+        if (this.processingLock) {
+            log("Verarbeitung gesperrt, versuche Zählerwechsel später erneut.", "warn");
+            return;
+        }
+        this.processingLock = true;
+        
+        try {
+            let neuerZaehlerstand = this.holeWert("Strom_Zaehlerwechsel_Neuer_Wert");
+            if (typeof neuerZaehlerstand !== "number" || isNaN(neuerZaehlerstand)) {
+                log("Fehler beim Zählerwechsel: Ungültiger neuer Zählerstand.", "error");
+                return;
+            }
+
+            let aktuellerZaehlerstand = await this.getStateCached(this.config.basePath + "Strom_Zaehlerstand") ?? 0;
+            let differenz = neuerZaehlerstand - aktuellerZaehlerstand;
+
+            if (Math.abs(differenz) < 0.001) {
+                log("Zählerwechsel abgebrochen: Der neue Zählerstand entspricht bereits dem aktuellen.", "info");
+                return;
+            }
+
+            log(`Führe Zählerwechsel aus. Alter Stand: ${aktuellerZaehlerstand} kWh, Neuer Stand: ${neuerZaehlerstand} kWh. Differenz: ${differenz} kWh`, "info");
+
+            // 1. Startoffset anpassen
+            let alterStartOffset = await this.getStateCached(this.config.basePath + "Strom_Zaehler_Startoffset") ?? 0;
+            let neuerStartOffset = Utils.rundenKwh(alterStartOffset + differenz);
+            await this.schreibeWertAsync("Strom_Zaehler_Startoffset", neuerStartOffset);
+
+            // 2. Referenzen anpassen (Verbräuche bleiben somit intakt)
+            const perioden = [
+                "Strom_Referenz_heute",
+                "Strom_Referenz_Woche",
+                "Strom_Referenz_Monat",
+                "Strom_Referenz_Kalenderjahr",
+                "Strom_Referenz_Ablesung"
+            ];
+
+            for (const refId of perioden) {
+                let alteReferenz = await this.getStateCached(this.config.basePath + refId) ?? 0;
+                let neueReferenz = Utils.rundenKwh(alteReferenz + differenz);
+                await this.schreibeWertAsync(refId, neueReferenz);
+            }
+
+            // 3. Plausibilitäts-Wächter aktualisieren
+            this.letzterPlausiblerZaehlerstand = neuerZaehlerstand;
+
+            // 4. Zählerstand sofort aktualisieren
+            await this.schreibeWertAsync("Strom_Zaehlerstand", neuerZaehlerstand);
+
+            log("Zählerwechsel erfolgreich abgeschlossen. Referenzen wurden angepasst, Verbräuche bleiben intakt.", "info");
+        } catch (error) {
+            await this.handleError("Zählerwechsel", error);
+        } finally {
+            this.processingLock = false;
+            await this.schreibeWertAsync("Strom_Zaehlerwechsel_Trigger", false, true);
+        }
     }
 
     async schichteTagesWerteUm() {
