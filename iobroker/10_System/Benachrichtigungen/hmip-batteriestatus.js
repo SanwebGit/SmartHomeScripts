@@ -1,250 +1,314 @@
-/*
+/**
  * =================================================================================
- * ioBroker Skript: Batterie-Status-Prüfung für Homematic(IP)
+ * ioBroker Skript: Batterie-Status-Prüfung für Homematic(IP) (Enterprise Plus)
  * =================================================================================
  *
- * Autor: Gemini
- * Version: 3.1 (Skript gekapselt)
- * Erstellt am: 19.09.2025
+ * Version: 6.3
+ * Letztes Update: 04.03.2026
  *
- * Beschreibung:
- * Dieses Skript überwacht alle batteriebetriebenen Homematic(IP)-Geräte, die einer
- * bestimmten Aufzählung (z.B. "Batteriebetrieben") zugeordnet sind. Es prüft
- * zyklisch den Batteriestatus und versendet eine zusammenfassende Benachrichtigung,
- * wenn bei einem oder mehreren Geräten die Batterie schwach ist.
- *
- * Features:
- * - Automatische Erkennung von Geräten mit schwacher Batterie (`LOW_BAT`/`LOWBAT`).
- * - Zusätzliches Auslesen der Betriebsspannung (`OPERATING_VOLTAGE`) für eine
- * detailliertere Analyse.
- * - Bestimmung des benötigten Batterietyps (z.B. AA, AAA) basierend auf dem
- * Gerätemodell.
- * - Versand von Benachrichtigungen über Pushover, Telegram und Gotify.
- * - Konfigurierbarer Zeitplan für die automatische Ausführung.
- * - Saubere und übersichtliche Log-Ausgaben.
- *
- * --- Versionshistorie ---
- * V 1.0 - 1.8: Initialentwicklung und Hinzufügen verschiedener Benachrichtigungsdienste.
- * V 2.0:         Großes Refactoring mit zentraler Konfiguration, Spannungsabfrage
- * und effizienterer Datenverarbeitung.
- * V 2.1:         Entfernung der VIS-Integration zur Vereinfachung.
- * V 2.2:         Einführung eines Log-Präfixes zur besseren Filterung.
- * V 3.0 (Final): Kommentare vollständig überarbeitet, Code-Struktur finalisiert
- * und JSDoc-Dokumentation für bessere Wartbarkeit ergänzt.
- * V 3.1:         Gesamtes Skript in eine IIFE gekapselt, um globale Konflikte zu vermeiden.
+ * Änderungen in V6.3:
+ * - Fix: 'getIsMemberAsync' entfernt (keine Standard-Funktion).
+ * - Optimierung: Nutzt nun die 'common.members' der Enum zur Identifizierung der Geräte.
+ * - Performance: Gezielte Suche nach LOWBAT-States nur innerhalb der Enum-Mitglieder.
  * =================================================================================
  */
 
 (async () => {
-
     // --- KONFIGURATION ---
-    // In diesem Bereich können alle benutzerspezifischen Einstellungen vorgenommen werden.
     const CONFIG = {
-        // Name der Aufzählung (Gewerk), der alle batteriebetriebenen Geräte zugeordnet sind.
-        // Beispiel: "enum.functions.batterie" oder "enum.functions.battery"
         ENUM_NAME: "enum.functions.batteriebetrieben",
-
-        // Bei 'true' werden detaillierte Informationen im Log ausgegeben, auch wenn keine
-        // Batterie schwach ist. Nützlich für die Fehlersuche.
+        SCHEDULE: "30 0 * * *",                        
+        NOTIFY_EVERY_H: 24,                            
+        
         ENABLE_LOGGING: true,
+        LOG_LEVEL: "info",                             // "info" oder "debug"
+        ASYNC_TIMEOUT: 5000,                           // Globaler Timeout für async Calls
+        CACHE_TTL_MS: 3600000,                         // Cache-Gültigkeit: 1 Stunde
 
-        // Konfiguration der Benachrichtigungsdienste
+        STATE_BASE_PATH: "0_userdata.0.System.Batterien.batterie_check.",
+
         NOTIFICATIONS: {
-            // Genereller Schalter: 'true', um Benachrichtigungen zu senden, 'false' zum Deaktivieren.
             SEND: true,
-
-            // Pushover-Adapter-Einstellungen
-            PUSHOVER: {
-                ENABLED: true,
-                INSTANCE: 'pushover.0' // Instanz des Pushover-Adapters
-            },
-
-            // Telegram-Adapter-Einstellungen
-            TELEGRAM: {
-                ENABLED: true,
-                INSTANCE: 'telegram.0' // Instanz des Telegram-Adapters
-            },
-
-            // Gotify-Adapter-Einstellungen
-            GOTIFY: {
-                ENABLED: false,
-                INSTANCE: 'gotify.0' // Instanz des Gotify-Adapters
-            }
+            PUSHOVER: { ENABLED: true, INSTANCE: 'pushover.0' },
+            TELEGRAM: { ENABLED: true, INSTANCE: 'telegram.0' },
+            GOTIFY: { ENABLED: false, INSTANCE: 'gotify.0' }
         },
 
-        // Mapping von Gerätemodellen zu Batterietypen und deren Minimalspannung.
-        // Diese Liste kann bei Bedarf für eigene Geräte erweitert werden.
-        // Die Minimalspannung dient als Referenzwert für die `OPERATING_VOLTAGE`.
+        // Zuordnung der Batterietypen zur Information in der Nachricht
         BATTERY_TYPES: {
-            // AA Batterien
-            "HMIP-eTRV-2":   { type: "AA", minVoltage: 2.2 },
-            "HmIP-STHD":     { type: "AA", minVoltage: 2.2 },
-            "HmIP-SLO":      { type: "AA", minVoltage: 2.2 },
-            "HmIP-SPI":      { type: "AA", minVoltage: 2.2 },
-            "HmIP-STHO-A":   { type: "AA", minVoltage: 2.2 },
-            "HmIP-DSD-PCB":  { type: "AA", minVoltage: 2.2 },
-            "HM-ES-TX-WM":   { type: "AA", minVoltage: 2.2 },
-            "HmIP-STE2-PCB": { type: "AA", minVoltage: 2.2 },
-            // AAA Batterien
-            "HmIP-SWDO-I":   { type: "AAA", minVoltage: 2.2 },
-            "HmIP-SCI":      { type: "AAA", minVoltage: 2.2 },
-            "HmIP-SWDO-PL":  { type: "AAA", minVoltage: 2.2 },
-            "HmIP-WKP":      { type: "AAA", minVoltage: 2.2 },
-            "HmIP-WRC2":     { type: "AAA", minVoltage: 2.2 }
+            "HMIP-eTRV-2":   { type: "AA" },
+            "HmIP-STHD":     { type: "AA" },
+            "HmIP-SWDO-I":   { type: "AAA" },
+            "HmIP-WRC2":     { type: "AAA" },
+            "HmIP-SWDO":     { type: "AAA" },
+            "HmIP-SMI":      { type: "AA" },
+            "HmIP-SMO":      { type: "AA" }
         }
     };
 
-    // =================================================================================
-    // --- SKRIPT-LOGIK (ab hier sind keine Änderungen erforderlich) ---
-    // =================================================================================
-
     const LOG_PREFIX = "[Batterie-Check] ";
+    
+    const deviceCache = new Map();
+    const notificationCache = new Map();
 
     /**
-     * Sammelt die Geräte-IDs aller Geräte, bei denen LOW_BAT oder LOWBAT `true` ist
-     * und die der konfigurierten Aufzählung angehören.
-     * @returns {string[]} Ein Array mit eindeutigen ioBroker-Geräte-IDs.
+     * Zentrales Logging
      */
-    function getLowBatteryDeviceIds() {
-        // Selektoren für beide gängigen Datenpunktnamen (LOW_BAT und LOWBAT)
-        const lowBatSelector = $(`state[id$=.0.LOW_BAT][state.val=true][${CONFIG.ENUM_NAME}]`);
-        const lowbatSelector = $(`state[id$=.0.LOWBAT][state.val=true][${CONFIG.ENUM_NAME}]`);
-        
-        // Beide Selektor-Ergebnisse zusammenführen
-        const stateIds = [...new Set([...lowBatSelector, ...lowbatSelector])];
-        
-        // Von den Datenpunkt-IDs auf die übergeordnete Geräte-ID extrahieren
-        // z.B. von "hm-rpc.0.ABC1234567.0.LOW_BAT" zu "hm-rpc.0.ABC1234567"
-        const deviceIds = stateIds.map(id => id.split('.').slice(0, 3).join('.'));
-
-        // Sicherstellen, dass jede Geräte-ID nur einmal vorkommt
-        return [...new Set(deviceIds)];
+    function logMsg(msg, level = "info") {
+        if (level === "debug" && CONFIG.LOG_LEVEL !== "debug") return;
+        const formattedMsg = LOG_PREFIX + (level === "debug" ? "DEBUG: " : "") + msg;
+        if (level === "error") log(formattedMsg, "error");
+        else if (level === "warn") log(formattedMsg, "warn");
+        else log(formattedMsg, "info");
     }
 
     /**
-     * Ruft für eine Liste von Geräte-IDs die Detailinformationen (Name, Typ, Spannung) ab.
-     * @param {string[]} deviceIds - Ein Array von zu verarbeitenden Geräte-IDs.
-     * @returns {Promise<object[]>} Ein Promise, das ein Array von Objekten mit Gerätedetails zurückgibt.
+     * Hilfsfunktion für asynchrone Aufrufe mit Timeout
      */
-    async function processDevices(deviceIds) {
-        // Alle Abfragen parallel ausführen, um Zeit zu sparen
-        const devicePromises = deviceIds.map(async (deviceId) => {
-            const deviceObject = await getObjectAsync(deviceId);
-            if (!deviceObject) return null; // Gerät nicht gefunden, überspringen
+    async function withTimeout(promise, context = "Async Call") {
+        let timeoutHandle;
+        const timeoutPromise = new Promise((_, reject) => 
+            timeoutHandle = setTimeout(() => reject(new Error(`Timeout (${CONFIG.ASYNC_TIMEOUT}ms): ${context}`)), CONFIG.ASYNC_TIMEOUT)
+        );
+        return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timeoutHandle));
+    }
 
-            // Spannungswert des Geräts abfragen
-            const voltageStateId = `${deviceId}.0.OPERATING_VOLTAGE`;
-            const voltageState = await getStateAsync(voltageStateId);
+    /**
+     * Sicherer JSON-Parser
+     */
+    function safeJsonParse(str, fallback = {}) {
+        try {
+            return str ? JSON.parse(str) : fallback;
+        } catch (e) {
+            logMsg(`Fehler beim Parsen von JSON: ${e.message}. Nutze Fallback.`, "warn");
+            return fallback;
+        }
+    }
+
+    /**
+     * Bereinigt veraltete Einträge aus dem Device-Cache
+     */
+    function performCacheHousekeeping() {
+        const now = Date.now();
+        let count = 0;
+        for (const [key, val] of deviceCache.entries()) {
+            if (now - val.ts > CONFIG.CACHE_TTL_MS) {
+                deviceCache.delete(key);
+                count++;
+            }
+        }
+        if (count > 0) logMsg(`Cache bereinigt: ${count} veraltete Einträge entfernt.`, "debug");
+    }
+
+    /**
+     * Caching-Logik für Objekte
+     */
+    async function getCachedObject(id) {
+        const cached = deviceCache.get(id);
+        if (cached && (Date.now() - cached.ts < CONFIG.CACHE_TTL_MS)) {
+            return cached.obj;
+        }
+        const obj = await withTimeout(getObjectAsync(id), `getObject(${id})`);
+        deviceCache.set(id, { obj, ts: Date.now() });
+        return obj;
+    }
+
+    /**
+     * Validiert die Konfiguration beim Start
+     */
+    async function validateConfig() {
+        if (!CONFIG.ENUM_NAME) throw new Error("ENUM_NAME ist nicht definiert.");
+        if (!CONFIG.STATE_BASE_PATH.endsWith('.')) CONFIG.STATE_BASE_PATH += '.';
+
+        const enumObj = await getObjectAsync(CONFIG.ENUM_NAME);
+        if (!enumObj) throw new Error(`Enum '${CONFIG.ENUM_NAME}' existiert nicht.`);
+
+        if (CONFIG.NOTIFICATIONS.SEND) {
+            for (const [key, service] of Object.entries(CONFIG.NOTIFICATIONS)) {
+                if (typeof service === 'object' && service.ENABLED) {
+                    const inst = await getObjectAsync(`system.adapter.${service.INSTANCE}`);
+                    if (!inst) logMsg(`Instanz ${service.INSTANCE} (${key}) nicht gefunden!`, "error");
+                }
+            }
+        }
+    }
+
+    /**
+     * Initialisierung der States
+     */
+    async function init() {
+        logMsg("Initialisiere System (V6.3)...", "debug");
+        await validateConfig();
+
+        await createStateAsync(CONFIG.STATE_BASE_PATH + "lastCheck", { name: "Letzter Check", type: "string", role: "date", read: true, write: false });
+        await createStateAsync(CONFIG.STATE_BASE_PATH + "lowCount", { name: "Anzahl schwache Batterien", type: "number", role: "value", read: true, write: false, def: 0 });
+        await createStateAsync(CONFIG.STATE_BASE_PATH + "jsonList", { name: "Geräteliste JSON", type: "string", role: "json", read: true, write: false });
+        await createStateAsync(CONFIG.STATE_BASE_PATH + "lastNotifications", { name: "Benachrichtigungs-Historie", type: "string", role: "json", read: true, write: true, def: "{}" });
+
+        const hist = await getStateAsync(CONFIG.STATE_BASE_PATH + "lastNotifications");
+        const data = safeJsonParse(hist ? hist.val : "{}");
+        Object.keys(data).forEach(k => notificationCache.set(k, data[k]));
+    }
+
+    /**
+     * Sendet Benachrichtigungen über einen sicheren Wrapper mit Callback-Handling
+     */
+    async function sendNotification(service, instance, payload) {
+        try {
+            await withTimeout(new Promise((resolve) => {
+                const callbackTimer = setTimeout(() => {
+                    logMsg(`Callback-Timeout für ${service}, fahre fort...`, "debug");
+                    resolve(); 
+                }, 2000); 
+                        
+                sendTo(instance, payload, (res) => {
+                    clearTimeout(callbackTimer);
+                    resolve(res);
+                });
+            }), `sendTo(${instance})`);
+        } catch (e) {
+            logMsg(`Fehler beim Senden über ${service} (${instance}): ${e.message}`, "error");
+        }
+    }
+
+    /**
+     * Findet alle LOWBAT-States der Enum-Mitglieder
+     */
+    async function getProblematicDevices() {
+        const enumObj = await getCachedObject(CONFIG.ENUM_NAME);
+        if (!enumObj || !enumObj.common || !enumObj.common.members) {
+            logMsg("Enum hat keine Mitglieder oder wurde nicht gefunden.", "warn");
+            return [];
+        }
+
+        const members = enumObj.common.members;
+        const resultIds = [];
+
+        // Wir prüfen für jedes Mitglied der Enum, ob es (oder ein Unter-State) ein Batterieproblem hat
+        await Promise.all(members.map(async (memberId) => {
+            try {
+                // Suche LOWBAT/LOW_BAT Zustände, die dem Mitglied zugeordnet sind
+                const batteryStates = $(`state[id=${memberId}.LOWBAT], state[id=${memberId}.*.LOWBAT], state[id=${memberId}.LOW_BAT], state[id=${memberId}.*.LOW_BAT]`);
+                
+                for (const stateId of batteryStates) {
+                    const state = await getStateAsync(stateId);
+                    if (state && state.val === true) {
+                        // Wir kürzen auf die Geräte-ID (erste 3 Segmente)
+                        resultIds.push(stateId.split('.').slice(0, 3).join('.'));
+                    }
+                }
+            } catch (e) {
+                logMsg(`Fehler bei Prüfung von Mitglied ${memberId}: ${e.message}`, "debug");
+            }
+        }));
+
+        return [...new Set(resultIds)];
+    }
+
+    /**
+     * Verarbeitet Gerätedetails
+     */
+    async function processDevice(deviceId) {
+        try {
+            const obj = await getCachedObject(deviceId);
+            if (!obj) return null;
+
+            const model = obj.native.TYPE || obj.common.role || "Unbekannt";
+            const batteryInfo = CONFIG.BATTERY_TYPES[model] || { type: "Unbekannt" };
             
-            // Batterietyp und Minimalspannung aus der Konfiguration ermitteln
-            const deviceType = deviceObject.native.TYPE || '';
-            const batteryInfo = CONFIG.BATTERY_TYPES[deviceType] || { type: "Unbekannt", minVoltage: 0 };
+            let voltage = "N/A";
+            try {
+                const vStates = await withTimeout($(`state[id=${deviceId}.*.OPERATING_VOLTAGE]`), `findVoltage(${deviceId})`);
+                if (vStates && vStates.length > 0) {
+                    const vVal = await getStateAsync(vStates[0]);
+                    if (vVal) voltage = vVal.val;
+                }
+            } catch (vErr) {
+                logMsg(`Konnte Spannung für ${deviceId} nicht ermitteln.`, "debug");
+            }
 
-            return {
-                name: deviceObject.common.name,
-                type: batteryInfo.type,
-                voltage: voltageState ? voltageState.val : 'N/A', // N/A, falls keine Spannung gelesen werden kann
-                minVoltage: batteryInfo.minVoltage
-            };
-        });
-
-        // Warten, bis alle Abfragen abgeschlossen sind
-        const devices = await Promise.all(devicePromises);
-        
-        // Leere Ergebnisse (falls ein Gerät nicht gefunden wurde) herausfiltern
-        return devices.filter(d => d !== null);
-    }
-
-    /**
-     * Erstellt die finale Nachricht (als reinen Text und als HTML) aus den Gerätedaten.
-     * @param {object[]} devices - Eine Liste der Geräte mit schwacher Batterie.
-     * @returns {{summaryText: string, summaryHtml: string}} Ein Objekt mit der Text- und HTML-Nachricht.
-     */
-    function buildMessages(devices) {
-        // Fall 1: Keine Geräte gefunden
-        if (devices.length === 0) {
-            const message = "Keine Geräte mit schwacher Batterie gefunden. Alles in Ordnung.";
-            return { summaryText: message, summaryHtml: message };
-        }
-
-        // Fall 2: Mindestens ein Gerät gefunden
-        const count = devices.length;
-        let textList = "";
-        let htmlList = "";
-
-        // Liste für die Nachricht zusammenbauen
-        devices.forEach((device) => {
-            const voltageInfo = device.voltage !== 'N/A' ? `(${device.voltage}V / min ${device.minVoltage}V)` : '';
-            textList += `\n- ${device.name} (benötigt ${device.type}) ${voltageInfo}`;
-            htmlList += `\n- <b>${device.name}</b> (benötigt ${device.type}) ${voltageInfo}`;
-        });
-
-        const summaryText = `Insgesamt ${count} Geräte mit schwacher Batterie gefunden.${textList}`;
-        const summaryHtml = `Insgesamt <b>${count}</b> Geräte mit schwacher Batterie gefunden.${htmlList}`;
-        
-        return { summaryText, summaryHtml };
-    }
-
-    /**
-     * Sendet die erstellten Nachrichten an alle aktivierten Benachrichtigungsdienste.
-     * @param {string} text - Die reine Textnachricht für Dienste, die kein HTML unterstützen (z.B. Gotify).
-     * @param {string} html - Die HTML-formatierte Nachricht für Dienste wie Pushover und Telegram.
-     */
-    function sendAllNotifications(text, html) {
-        if (!CONFIG.NOTIFICATIONS.SEND) return;
-
-        const { PUSHOVER, TELEGRAM, GOTIFY } = CONFIG.NOTIFICATIONS;
-        const title = 'Batterie-Status-Meldung';
-
-        if (PUSHOVER.ENABLED) {
-            // @ts-ignore
-            sendTo(PUSHOVER.INSTANCE, { message: html, title: title, html: 1 });
-            log(LOG_PREFIX + "INFO: Benachrichtigung an Pushover gesendet.");
-        }
-        if (TELEGRAM.ENABLED) {
-            // @ts-ignore
-            sendTo(TELEGRAM.INSTANCE, { text: html, parse_mode: 'HTML' });
-            log(LOG_PREFIX + "INFO: Benachrichtigung an Telegram gesendet.");
-        }
-        if (GOTIFY.ENABLED) {
-            // @ts-ignore
-            sendTo(GOTIFY.INSTANCE, { message: text, title: title });
-            log(LOG_PREFIX + "INFO: Benachrichtigung an Gotify gesendet.");
+            return { id: deviceId, name: obj.common.name || deviceId, model, battery: batteryInfo.type, voltage };
+        } catch (e) {
+            logMsg(`Fehler bei Verarbeitung von ${deviceId}: ${e.message}`, "error");
+            return null;
         }
     }
 
     /**
-     * Hauptfunktion, die den gesamten Prozess steuert.
+     * Hauptprozess
      */
     async function checkBatteryStatus() {
-        log(LOG_PREFIX + `--- Starte Batteriestatus-Prüfung (v3.1) ---`);
+        const startTime = Date.now();
+        logMsg("Batteriestatus-Prüfung gestartet.");
         
-        const deviceIds = getLowBatteryDeviceIds();
-        const devices = await processDevices(deviceIds);
-        const { summaryText, summaryHtml } = buildMessages(devices);
+        performCacheHousekeeping();
 
-        // Log-Ausgabe nur, wenn Logging aktiviert ist oder tatsächlich Geräte gefunden wurden
-        if (CONFIG.ENABLE_LOGGING || devices.length > 0) {
-            log(LOG_PREFIX + summaryText);
+        try {
+            const deviceIds = await getProblematicDevices();
+
+            if (deviceIds.length === 0) {
+                await setStateAsync(CONFIG.STATE_BASE_PATH + "lowCount", 0, true);
+                await setStateAsync(CONFIG.STATE_BASE_PATH + "jsonList", "[]", true);
+                logMsg("Keine kritischen Batteriestände gefunden.");
+            } else {
+                const results = (await Promise.all(deviceIds.map(id => processDevice(id)))).filter(r => r !== null);
+
+                const now = Date.now();
+                const toNotify = results.filter(d => {
+                    const last = notificationCache.get(d.id) || 0;
+                    return (now - last) > (CONFIG.NOTIFY_EVERY_H * 3600000);
+                });
+
+                if (toNotify.length > 0) {
+                    let textMsg = `Batterie-Warnung: ${toNotify.length} Geräte melden niedrigen Stand.`;
+                    let htmlMsg = `<b>Batterie-Warnung!</b><ul>`;
+                    
+                    toNotify.forEach(d => {
+                        const vInfo = d.voltage !== "N/A" ? ` (Aktuell: ${d.voltage}V)` : "";
+                        textMsg += `\n- ${d.name} (${d.model}): Typ ${d.battery}${vInfo}`;
+                        htmlMsg += `<li><b>${d.name}</b> (${d.model}): Typ ${d.battery}${vInfo}</li>`;
+                        notificationCache.set(d.id, now);
+                    });
+                    htmlMsg += "</ul>";
+
+                    if (CONFIG.NOTIFICATIONS.SEND) {
+                        const { PUSHOVER, TELEGRAM, GOTIFY } = CONFIG.NOTIFICATIONS;
+                        if (PUSHOVER.ENABLED) await sendNotification("Pushover", PUSHOVER.INSTANCE, { message: htmlMsg, html: 1, title: "Batterie Check" });
+                        if (TELEGRAM.ENABLED) await sendNotification("Telegram", TELEGRAM.INSTANCE, { text: htmlMsg, parse_mode: 'HTML' });
+                        if (GOTIFY.ENABLED)   await sendNotification("Gotify", GOTIFY.INSTANCE, { message: textMsg, title: "Batterie Check" });
+                    }
+                    
+                    const histObj = {};
+                    notificationCache.forEach((val, key) => histObj[key] = val);
+                    await setStateAsync(CONFIG.STATE_BASE_PATH + "lastNotifications", JSON.stringify(histObj), true);
+                }
+
+                await setStateAsync(CONFIG.STATE_BASE_PATH + "lowCount", results.length, true);
+                await setStateAsync(CONFIG.STATE_BASE_PATH + "jsonList", JSON.stringify(results), true);
+                logMsg(`Check beendet. ${results.length} Geräte betroffen.`);
+            }
+
+            await setStateAsync(CONFIG.STATE_BASE_PATH + "lastCheck", new Date().toISOString(), true);
+
+        } catch (err) {
+            logMsg("KRITISCHER FEHLER: " + err.message, "error");
+        } finally {
+            logMsg(`Ausführungsdauer: ${(Date.now() - startTime) / 1000}s`, "debug");
         }
-        
-        // Benachrichtigungen nur senden, wenn Geräte gefunden wurden
-        if (devices.length > 0) {
-            sendAllNotifications(summaryText, summaryHtml);
-        }
-        
-        log(LOG_PREFIX + "--- Skriptausführung beendet ---");
     }
 
-    // --- SKRIPTAUSFÜHRUNG ---
+    // --- START ---
+    try {
+        await init();
+        await checkBatteryStatus();
 
-    // Das Skript wird einmal direkt bei Start ausgeführt.
-    checkBatteryStatus();
-
-    // Anschließend wird es nach dem definierten Zeitplan täglich wiederholt.
-    // CRON-Syntax: 'Minute Stunde * * *' -> '30 0 * * *' bedeutet täglich um 00:30 Uhr.
-    // @ts-ignore
-    schedule('30 0 * * *', checkBatteryStatus);
-
+        if (CONFIG.SCHEDULE) {
+            schedule(CONFIG.SCHEDULE, async () => {
+                await checkBatteryStatus();
+            });
+            logMsg(`Zeitplan aktiv: ${CONFIG.SCHEDULE}`, "debug");
+        }
+    } catch (e) {
+        logMsg("Initialisierungsfehler: " + e.message, "error");
+    }
 })();
-
