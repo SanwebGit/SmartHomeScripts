@@ -39,6 +39,16 @@
             startingHysteresisMin: 2,
             finishingHysteresisMin: 5,
             pauseHysteresisMin: 15,
+        },
+        {
+            deviceName: 'Spülmaschine',
+            powerSensorId: 'zigbee2mqtt.0.0xa4c1380557daffff.load_power',
+            energySensorId: 'zigbee2mqtt.0.0xa4c1380557daffff.energy',
+            startingThreshold: 10.0,
+            finishingThreshold: 5.0,
+            startingHysteresisMin: 2,
+            finishingHysteresisMin: 5,
+            pauseHysteresisMin: 15,
         }
     ];
 
