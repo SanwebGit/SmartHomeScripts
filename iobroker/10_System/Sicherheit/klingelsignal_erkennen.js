@@ -6,6 +6,7 @@
  * Autor:        Sanweb
  * * -----------------------------------------------------------------------------
  * Versionshistorie:
+ * v1.0.2  | 05.03.2026 | Korrektur Datenpunkt Klingelsignal (PRESS_SHORT)
  * v1.0.1  | 04.03.2026 | Auto-Create für fehlende Datenpunkte hinzugefügt
  * v1.0.0  | 04.03.2026 | Initiale Version
  *******************************************************************************/
@@ -15,9 +16,8 @@
 // ==============================================================================
 (async () => {
 
-// Der von dir genannte Datenpunkt des HmIP Klingelsensors
-// (Hinweis: '1.STATE' repräsentiert Kanal 1 und den Datenpunkt STATE)
-const DP_KLINGEL = 'hm-rpc.0.0026E0C998D1F2.1.STATE';
+// Der korrigierte Datenpunkt des HmIP Klingelsensors (Button State)
+const DP_KLINGEL = 'hm-rpc.0.0026E0C998D1F2.1.PRESS_SHORT';
 
 // Datenpunkt der Zutrittskontrolle (Boolean erwartet: true = gewährt, false = verweigert)
 // Falls du eine Werteliste nutzt, muss die Abfrage weiter unten angepasst werden.
