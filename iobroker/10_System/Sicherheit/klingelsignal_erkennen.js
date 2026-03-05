@@ -1,46 +1,51 @@
 /*******************************************************************************
  * Skriptname:   Klingelsignal & Sturm Protection
- * Beschreibung: Verarbeitet das Klingelsignal (HmIP), steuert den Türsummer 
- * bei gewährtem Zutritt und gibt eine Alexa-Sprachmeldung aus.
- * Inklusive "Sturm Protection" (Cooldown) gegen Dauer-Klingeln.
+ * Beschreibung: Verarbeitet HmIP-Klingelsignal, steuert Türsummer bei 
+ * gewährtem Zutritt und gibt Alexa-Sprachmeldung aus.
  * Autor:        Sanweb
  * * -----------------------------------------------------------------------------
  * Versionshistorie:
- * v1.2.0  | 05.03.2026 | Konfiguration in Objekt ausgelagert,
- * | Timeout für Alexa hinzugefügt, doppelten Türsummer-Start verhindert.
- * v1.1.0  | 05.03.2026 | Komplettes Refactoring auf asynchrone API (*Async), 
- * | Try-Catch-Fehlerbehandlung, erweiterte Typsicherheit,
- * | Fallbacks für Uhrzeiten & parsen.
- * v1.0.3  | 05.03.2026 | Datumsformat auf YYYY-MM-DD - HH:MM:SS geändert
- * v1.0.2  | 05.03.2026 | Korrektur Datenpunkt Klingelsignal (PRESS_SHORT)
- * v1.0.1  | 04.03.2026 | Auto-Create für fehlende Datenpunkte hinzugefügt
+ * v1.2.1  | 05.03.2026 | Kommentare kompakt zusammengefasst
+ * v1.2.0  | 05.03.2026 | Konfig in Objekt, Alexa-Timeout, Türsummer-Check
+ * v1.1.0  | 05.03.2026 | Refactoring auf asynchrone API (*Async), Typsicherheit
+ * v1.0.3  | 05.03.2026 | Datumsformat auf YYYY-MM-DD - HH:MM:SS
  * v1.0.0  | 04.03.2026 | Initiale Version
  *******************************************************************************/
 
 (async () => {
 
 // ==============================================================================
-// KONFIGURATION: DATENPUNKTE BITTE ANPASSEN
+// KONFIGURATION: DATENPUNKTE (Bitte an eigene IDs anpassen)
 // ==============================================================================
+
+// Trigger: HmIP Klingelsensor (meist Kanal 1, 'PRESS_SHORT')
 const DP_KLINGEL = 'hm-rpc.0.0026E0C998D1F2.1.PRESS_SHORT';
+
+// Schalter: true = Tür öffnen, false = Alexa klingelt (Wird auto-erstellt)
 const DP_ZUTRITTSKONTROLLE = '0_userdata.0.Haustuer.Zutrittskontrolle_Haustuer';
+
+// Speicher: Letzter Klingelzeitpunkt für Cooldown (Wird auto-erstellt)
 const DP_LAST_RING = '0_userdata.0.Haustuer.Klingel_LastRingTime';
+
+// Aktor: Türsummer (Boolean, meist Kanal 3 oder 4, 'STATE')
 const DP_TUERSUMMER = 'hm-rpc.0.00045A49A87CFF.3.STATE';
+
+// Aktor: Alexa Sprachausgabe (.Commands.speak)
 const DP_ALEXA_SPEAK = 'alexa2.0.Echo-Devices.e4a56dc3ec9a497c9209c05d2c29a09d.Commands.speak';
 
 // ==============================================================================
-// KONFIGURATION: VARIABLEN UND BEFEHLE
+// KONFIGURATION: PARAMETER
 // ==============================================================================
 const CONFIG = {
     alexa: {
         message: 'Ding Dong, es hat an der Haustür geklingelt!',
-        startZeit: '11:00',
-        endZeit: '22:00',
-        timeoutMs: 5000
+        startZeit: '11:00', // Aktiv ab (HH:MM)
+        endZeit: '22:00',   // Aktiv bis (HH:MM)
+        timeoutMs: 5000     // Timeout für API-Call
     },
-    tuersummerDauerMs: 2000,
-    sturmProtectionMs: 30000,
-    debug: false
+    tuersummerDauerMs: 2000, // Anzugsdauer Summer in ms
+    sturmProtectionMs: 30000, // Cooldown gegen Dauerklingeln in ms
+    debug: false             // Debug-Logs im ioBroker
 };
 
 // Interne Variablen
@@ -51,7 +56,7 @@ let timerTuersummer = null;
 // HILFSFUNKTIONEN
 // ==============================================================================
 
-// Erweitertes Debug-Logging mit optionalem Kontext (Vorschlag 6)
+// Erweitertes Debug-Logging
 function logDebug(msg, data = null) {
     if (CONFIG.debug) {
         const context = data ? ` | Data: ${JSON.stringify(data)}` : '';
@@ -59,13 +64,13 @@ function logDebug(msg, data = null) {
     }
 }
 
-// Datum formatieren
+// Datum formatieren (YYYY-MM-DD - HH:MM:SS)
 function formatDateTime(dateObj) {
     const pad = (n) => n.toString().padStart(2, '0');
     return `${dateObj.getFullYear()}-${pad(dateObj.getMonth() + 1)}-${pad(dateObj.getDate())} - ${pad(dateObj.getHours())}:${pad(dateObj.getMinutes())}:${pad(dateObj.getSeconds())}`;
 }
 
-// Prüfen, ob Zeit im Fenster liegt
+// Prüfen, ob Zeit im konfigurierten Fenster liegt
 function isTimeInRange(startTime, endTime) {
     const now = new Date();
     const startParts = startTime.split(':');
@@ -78,7 +83,7 @@ function isTimeInRange(startTime, endTime) {
     return currentMins >= startMins && currentMins < endMins;
 }
 
-// Sicheres asynchrones Setzen von States (Vorschlag 1, 2, 7)
+// Sicheres asynchrones Setzen von States inkl. Fehlerbehandlung
 async function safeSetStateAsync(id, val, ack = false) {
     try {
         if (await existsStateAsync(id)) {
@@ -96,7 +101,7 @@ async function safeSetStateAsync(id, val, ack = false) {
 // INITIALISIERUNG
 // ==============================================================================
 (async () => {
-    // Validierung der Alexa-Zeiten mit Fallback (Vorschlag 4)
+    // Validierung der Alexa-Zeiten
     const isValidTime = (time) => /^([01]\d|2[0-3]):([0-5]\d)$/.test(time);
     if (!isValidTime(CONFIG.alexa.startZeit) || !isValidTime(CONFIG.alexa.endZeit)) {
         log(`WARNUNG: Ungültiges Zeitformat bei Alexa-Zeiten. Verwende Standard 00:00-23:59`, 'warn');
@@ -104,7 +109,7 @@ async function safeSetStateAsync(id, val, ack = false) {
         CONFIG.alexa.endZeit = '23:59';
     }
 
-    // Zutrittskontrolle anlegen
+    // Datenpunkt: Zutrittskontrolle anlegen
     if (!(await existsStateAsync(DP_ZUTRITTSKONTROLLE))) {
         log(`Datenpunkt ${DP_ZUTRITTSKONTROLLE} wird automatisch angelegt...`, 'info');
         await createStateAsync(DP_ZUTRITTSKONTROLLE, false, {
@@ -116,7 +121,7 @@ async function safeSetStateAsync(id, val, ack = false) {
         });
     }
 
-    // Letzter Klingelzeitpunkt anlegen/auslesen (Vorschlag 10)
+    // Datenpunkt: Letzter Klingelzeitpunkt anlegen & auslesen
     if (!(await existsStateAsync(DP_LAST_RING))) {
         log(`Datenpunkt ${DP_LAST_RING} wird automatisch angelegt...`, 'info');
         await createStateAsync(DP_LAST_RING, 'noch nie', {
@@ -134,8 +139,7 @@ async function safeSetStateAsync(id, val, ack = false) {
             const savedStr = stateLastRing?.val;
             
             if (typeof savedStr === 'string' && savedStr.includes(' - ')) {
-                const parseable = savedStr.replace(' - ', ' ');
-                const parsedDate = new Date(parseable);
+                const parsedDate = new Date(savedStr.replace(' - ', ' '));
                 if (!isNaN(parsedDate.getTime())) {
                     lastRingTime = parsedDate.getTime();
                     logDebug(`Letzter Klingelzeitpunkt erfolgreich geladen`, { timestamp: lastRingTime });
@@ -143,7 +147,7 @@ async function safeSetStateAsync(id, val, ack = false) {
                     throw new Error('Date parsing resulted in NaN');
                 }
             } else {
-                lastRingTime = 0; // Fallback, falls String unerwartetes Format hat
+                lastRingTime = 0; // Fallback
             }
         } catch (error) {
             log(`Fehler beim Parsen des letzten Klingelzeitpunkts, verwende 0. Detail: ${error}`, 'warn');
@@ -156,28 +160,25 @@ async function safeSetStateAsync(id, val, ack = false) {
 // HAUPTPROGRAMM (TRIGGER)
 // ==============================================================================
 
-// Trigger ist nun asynchron, nutzt das obj-Objekt (Vorschlag 3)
 on({id: DP_KLINGEL, val: true, ack: true}, async function (obj) {
     
-    // Wir nehmen den exakten Zeitstempel des Events anstatt Date.now(), ist minimal präziser
     const now = obj.state.ts || Date.now();
 
-    // 1. KLINGELSCHUTZ PRÜFEN
+    // 1. STURM PROTECTION (Cooldown prüfen)
     if ((now - lastRingTime) < CONFIG.sturmProtectionMs) {
         const remaining = Math.round((CONFIG.sturmProtectionMs - (now - lastRingTime)) / 1000);
         logDebug(`Klingel ignoriert (Sturm Protection aktiv, noch ${remaining}s).`);
         return;
     }
 
-    // Zeitstempel aktualisieren
+    // Cooldown-Timer aktualisieren & speichern
     lastRingTime = now;
     const formattedDate = formatDateTime(new Date(now));
     
-    // Status wegschreiben (ack = true, da Statusinformation)
     await safeSetStateAsync(DP_LAST_RING, formattedDate, true);
     log(`Klingelsignal erkannt um ${formattedDate}. Sturm Protection aktiviert.`, 'info');
 
-    // 2. STATUS ZUTRITTSKONTROLLE ABRUFEN (Vorschlag 2 & 9)
+    // 2. STATUS ZUTRITTSKONTROLLE
     let zutrittGewaehrt = false;
     try {
         if (await existsStateAsync(DP_ZUTRITTSKONTROLLE)) {
@@ -190,7 +191,7 @@ on({id: DP_KLINGEL, val: true, ack: true}, async function (obj) {
 
     // 3. AKTION AUSFÜHREN
     if (!zutrittGewaehrt) {
-        // NORMALER ABLAUF
+        // NORMALER ABLAUF (Alexa Sprachausgabe)
         if (isTimeInRange(CONFIG.alexa.startZeit, CONFIG.alexa.endZeit)) {
             try {
                 await Promise.race([
@@ -204,36 +205,34 @@ on({id: DP_KLINGEL, val: true, ack: true}, async function (obj) {
             logDebug(`Alexa stumm (außerhalb Zeitfenster: ${CONFIG.alexa.startZeit}-${CONFIG.alexa.endZeit}).`);
         }
     } else {
-        // ZUTRITT GEWÄHRT
+        // ZUTRITT GEWÄHRT (Türsummer aktivieren)
         log('Zutritt gewährt. Türsummer wird aktiviert.', 'info');
         
-        // Prüfen ob Datenpunkt existiert, bevor Timer-Logik startet (Vorschlag 5)
         if (await existsStateAsync(DP_TUERSUMMER)) {
             
-            // Prüfen ob Türsummer bereits aktiv ist
+            // Doppel-Auslösung verhindern
             const currentState = await getStateAsync(DP_TUERSUMMER);
             if (currentState?.val === true) {
-                logDebug('Türsummer ist bereits aktiv, überspringe erneute Aktivierung...');
-                // Zutrittskontrolle zurücksetzen, da sie quasi "verbraucht" wurde
+                logDebug('Türsummer ist bereits aktiv, überspringe...');
                 await safeSetStateAsync(DP_ZUTRITTSKONTROLLE, false, false);
                 return;
             }
 
+            // Summer ein
             await safeSetStateAsync(DP_TUERSUMMER, true, false);
 
-            // Verhindern mehrfacher Timer (Race Condition) (Vorschlag 8)
             if (timerTuersummer) clearTimeout(timerTuersummer);
             
+            // Summer aus & Reset nach Ablauf
             timerTuersummer = setTimeout(async () => {
                 await safeSetStateAsync(DP_TUERSUMMER, false, false);
                 timerTuersummer = null;
                 
-                // Zutrittskontrolle erst NACH erfolgreichem Öffnen zurücksetzen (Vorschlag 3)
                 await safeSetStateAsync(DP_ZUTRITTSKONTROLLE, false, false);
                 logDebug('Zutrittskontrolle nach Türöffnung zurückgesetzt.');
             }, CONFIG.tuersummerDauerMs);
         } else {
-            log(`Türsummer-Datenpunkt (${DP_TUERSUMMER}) fehlt! Zutrittskontrolle wird sicherheitshalber zurückgesetzt.`, 'error');
+            log(`Türsummer-Datenpunkt (${DP_TUERSUMMER}) fehlt! Zutrittskontrolle wird zurückgesetzt.`, 'error');
             await safeSetStateAsync(DP_ZUTRITTSKONTROLLE, false, false);
         }
     }
@@ -248,8 +247,7 @@ onStop(function () {
         timerTuersummer = null;
         log('Skript wird gestoppt. Bereinige Timer...', 'info');
         
-        // Notfall-Reset: Hier nutzen wir synchrones setState, da asynchrone 
-        // Aktionen beim Skript-Stop eventuell abgebrochen werden.
+        // Notfall-Reset (synchron)
         if (existsState(DP_TUERSUMMER)) {
             setState(DP_TUERSUMMER, false, false);
             log('Türsummer wegen Skript-Stopp sicherheitshalber ausgeschaltet.', 'info');
