@@ -41,7 +41,7 @@ const ALEXA_MESSAGE = 'Ding Dong, es hat an der Haustür geklingelt!';
 const ALEXA_START_ZEIT = '11:00';    // Ab wann darf Alexa sprechen? (Format HH:MM)
 const ALEXA_ENDE_ZEIT = '22:00';     // Bis wann darf Alexa sprechen? (Format HH:MM)
 const TUERSUMMER_DAUER_MS = 2000;    // Wie lange zieht der Türsummer an? (in Millisekunden)
-const STURM_PROTECTION_MS = 33000;   // Wie lange ist die Klingel nach Betätigung gesperrt? (in Millisekunden)
+const STURM_PROTECTION_MS = 30000;   // Wie lange ist die Klingel nach Betätigung gesperrt? (in Millisekunden)
 
 const DEBUG = false; // Auf true setzen für Entwicklung / detailliertes Logging
 
