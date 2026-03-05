@@ -1,146 +1,207 @@
-/*
- * SKRIPT-KONVERTIERUNG & OPTIMIERUNG FÜR IOBROKER
- *
- * Zweck: Bestimmt automatisch die Heizperiode anhand der Tagesmitteltemperatur.
- * Version: 2.7 (Laufzeitfehler durch Entfernen von TypeScript-Syntax behoben)
- *
- * Verbesserungen gegenüber dem ursprünglichen Homematic-Skript:
- * 1. Ereignisgesteuert: Das Skript wird nur bei Bedarf ausgeführt.
- * 2. Robuste Mittelwertberechnung: Zählt die Messungen für einen echten Durchschnitt.
- * 3. Automatische Datenpunkterstellung: Vereinfacht die Einrichtung erheblich.
- * 4. Stabilitäts-Check: Verarbeitet nur gültige Zahlenwerte vom Sensor.
- * 5. Gekapselt: Verhindert Konflikte mit anderen Skripten.
+/**
+ * ==============================================================================
+ * SCRIPT: Heizperioden-Monitor für ioBroker
+ * ==============================================================================
+ * Autor:         Sanweb
+ * Version:       5.4
+ * Letzte Änderung: 2024-05-22
+ * Zweck:         Automatisierte Bestimmung der Heizperiode basierend auf der 
+ * Tagesmitteltemperatur und kalendarischen Zeiträumen.
+ * Korrektur:     getStatesAsync durch Promise.all([getStateAsync...]) ersetzt.
+ * ==============================================================================
  */
 
 (async () => {
+    // --------------- KONFIGURATION ---------------
+    const CONFIG = {
+        // ID des Sensors, der die Außentemperatur liefert
+        sensor: "hm-rpc.0.0010DBE98CEC7B.1.ACTUAL_TEMPERATURE",
+        
+        // Temperatur-Grenzwert: Ist das Tagesmittel niedriger als dieser Wert, wird geheizt
+        heizgrenze: 18.0,
+        
+        // Uhrzeit für den täglichen Reset und die Berechnung des Vortages
+        resetTime: { hour: 2, minute: 50 },
+        
+        // Fehlertoleranz: Wartezeit in Minuten vor einem erneuten Berechnungsversuch
+        retryDelayMin: 15, 
+        
+        // Anzahl der maximalen Wiederholungsversuche bei Fehlern im Tagesabschluss
+        maxRetries: 3,
+        
+        // Heizperiode-Monate: Start (10 = Okt) bis Ende (5 = Mai)
+        months: { start: 10, end: 5 }, 
+        
+        // Plausibilitätsprüfung: Sensorwerte außerhalb dieses Bereichs werden ignoriert
+        limits: { min: -40, max: 60 },  
+        
+        // Zielpfade der ioBroker-Datenpunkte
+        paths: {
+            mittelwert: "0_userdata.0.Heizung.Allgemein.Tagesmittelwert",
+            summe: "0_userdata.0.Heizung.Allgemein.ZwischenspeicherSumme",
+            zaehler: "0_userdata.0.Heizung.Allgemein.MessungenZaehler",
+            aktiv: "0_userdata.0.Heizung.Allgemein.HeizperiodeAktiv",
+            letzterReset: "0_userdata.0.Heizung.Allgemein.LetzterReset",
+            letzterResetTS: "0_userdata.0.Heizung.Allgemein.LetzterResetTimestamp"
+        }
+    };
 
-    // --------------- ANPASSBARE PARAMETER ---------------
-
-    // ID des Außentemperatensors
-    const ID_SENSOR_TEMP = "hm-rpc.0.0010DBE98CEC7B.1.ACTUAL_TEMPERATURE";
-
-    // Schwellwert in °C: Unterhalb dieser Tagesmitteltemperatur wird die Heizperiode aktiv.
-    const HEIZGRENZE = 18.0;
-
-    // Uhrzeit für die tägliche Berechnung und den Reset.
-    const RESET_STUNDE = 2;
-    const RESET_MINUTE = 50;
-
-    // --------------- DATENPUNKTE (VOLLSTÄNDIGE PFADE) ---------------
-
-    const ID_MITTELWERT = "0_userdata.0.Heizung.Allgemein.Tagesmittelwert";
-    const ID_ZWISCHENSPEICHER = "0_userdata.0.Heizung.Allgemein.ZwischenspeicherSumme";
-    const ID_ZAEHLER = "0_userdata.0.Heizung.Allgemein.MessungenZaehler";
-    const ID_HEIZPERIODE = "0_userdata.0.Heizung.Allgemein.HeizperiodeAktiv";
-    const ID_LETZTER_RESET = "0_userdata.0.Heizung.Allgemein.LetzterReset";
-
+    // --------------- INTERNER STATUS ---------------
+    let stateCache = { summe: 0, zaehler: 0 };
+    let isResetting = false; 
 
     /**
-     * Erstellt alle notwendigen ioBroker-Datenpunkte, falls sie noch nicht existieren.
+     * Erstellt die Datenpunkt-Struktur im ioBroker, falls diese noch nicht existieren.
      */
-    async function erstelleDatenpunkte() {
-        log("Prüfe und erstelle benötigte Datenpunkte...");
-        const datenpunkte = {
-            [ID_MITTELWERT]: { name: "Tagesmitteltemperatur des letzten Tages", type: "number", role: "value.temperature", unit: "°C", def: 0 },
-            [ID_ZWISCHENSPEICHER]: { name: "Akkumulierte Temperatur für den aktuellen Tag", type: "number", role: "value.temperature", unit: "°C", def: 0 },
-            [ID_ZAEHLER]: { name: "Anzahl der Temperaturmessungen für den aktuellen Tag", type: "number", role: "value", unit: "", def: 0 },
-            [ID_HEIZPERIODE]: { name: "Heizperiode ist aktiv", type: "boolean", role: "indicator.heating", def: false },
-            [ID_LETZTER_RESET]: { name: "Datum des letzten Resets", type: "string", role: "date", unit: "", def: "nie" }
+    async function initDataPoints() {
+        const definitions = {
+            [CONFIG.paths.mittelwert]: { 
+                name: "Tagesmittelwert der Außentemperatur (Vortag)", 
+                type: "number", role: "value.temperature", unit: "°C", def: 0 
+            },
+            [CONFIG.paths.summe]: { 
+                name: "Akkumulierte Temperaturwerte des laufenden Tages", 
+                type: "number", role: "value.temperature", unit: "°C", def: 0 
+            },
+            [CONFIG.paths.zaehler]: { 
+                name: "Anzahl der eingegangenen Temperaturmessungen heute", 
+                type: "number", role: "value", unit: "", def: 0 
+            },
+            [CONFIG.paths.aktiv]: { 
+                name: "Status der Heizperiode (True = Aktiv)", 
+                type: "boolean", role: "indicator.heating", def: false 
+            },
+            [CONFIG.paths.letzterReset]: { 
+                name: "Datum der letzten Mittelwertberechnung (Text)", 
+                type: "string", role: "date", def: "nie" 
+            },
+            [CONFIG.paths.letzterResetTS]: { 
+                name: "Zeitpunkt der letzten Mittelwertberechnung (Timestamp)", 
+                type: "number", role: "value.datetime", def: 0 
+            }
         };
 
-        for (const [id, common] of Object.entries(datenpunkte)) {
-            if (!await existsStateAsync(id)) {
-                // @ts-ignore
-                await createStateAsync(id, common.def, { name: common.name, type: common.type, role: common.role, unit: common.unit, read: true, write: true });
-                log(`Datenpunkt '${id}' wurde erstellt.`);
+        for (const [id, common] of Object.entries(definitions)) {
+            if (!(await existsStateAsync(id))) {
+                await createStateAsync(id, common.def, { 
+                    name: common.name, type: common.type, role: common.role, 
+                    unit: common.unit || "", read: true, write: true 
+                });
             }
         }
-        log("Alle Datenpunkte sind vorhanden.");
     }
 
+    /**
+     * Berechnet den Heizstatus basierend auf dem letzten Mittelwert.
+     */
+    async function berechneHeizperiode() {
+        const jetzt = new Date();
+        const monat = jetzt.getMonth() + 1;
+        
+        const lastMittelState = await getStateAsync(CONFIG.paths.mittelwert);
+        const tagesMittel = (lastMittelState && typeof lastMittelState.val === 'number') ? lastMittelState.val : 0;
 
-    // --- HAUPTPROGRAMM ---
+        const istHeizZeitraum = (monat >= CONFIG.months.start || monat <= CONFIG.months.end);
+        const istUnterGrenze = (tagesMittel <= CONFIG.heizgrenze);
+        const aktiv = istHeizZeitraum && istUnterGrenze;
 
-    // 1. Alle benötigten States beim Skriptstart anlegen und darauf warten.
-    await erstelleDatenpunkte();
-
-    // Startmeldung ins Log schreiben
-    log(`Skript gestartet. Überwache Temperatursensor: ${ID_SENSOR_TEMP}`);
+        await setStateAsync(CONFIG.paths.aktiv, aktiv, true);
+        return aktiv;
+    }
 
     /**
-     * Trigger 1: Wird bei jeder Aktualisierung des Temperatursensors ausgeführt.
-     * Speichert die Temperatur und zählt die Messungen für die spätere Mittelwertbildung.
+     * Führt den Tagesabschluss durch mit Retry-Logik.
      */
-    // @ts-ignore
-    on({ id: ID_SENSOR_TEMP, change: "any" }, async function (obj) {
-        const aktuelleTemp = obj.state.val;
+    async function performDailyReset(attempt = 1) {
+        isResetting = true; 
+        try {
+            log(`Tagesabschluss (Versuch ${attempt}/${CONFIG.maxRetries + 1})...`);
+            
+            const tagesMittel = stateCache.zaehler > 0 ? (stateCache.summe / stateCache.zaehler) : 0;
+            const jetzt = new Date();
 
-        // Prüfung, ob der Wert eine gültige Zahl ist.
-        if (typeof aktuelleTemp !== 'number') {
-            log(`Ungültiger Wert vom Sensor empfangen: ${aktuelleTemp} (Typ: ${typeof aktuelleTemp}). Überspringe Verarbeitung.`, 'warn');
+            await setStateAsync(CONFIG.paths.mittelwert, parseFloat(tagesMittel.toFixed(2)), true);
+            await berechneHeizperiode();
+            await setStateAsync(CONFIG.paths.letzterReset, jetzt.toLocaleDateString('de-DE'), true);
+            await setStateAsync(CONFIG.paths.letzterResetTS, jetzt.getTime(), true);
+
+            stateCache.summe = 0;
+            stateCache.zaehler = 0;
+            await setStateAsync(CONFIG.paths.summe, 0, true);
+            await setStateAsync(CONFIG.paths.zaehler, 0, true);
+
+            log("Tagesabschluss erfolgreich durchgeführt.");
+        } catch (e) {
+            log(`Fehler beim Tagesabschluss: ${e.message}`, 'warn');
+            if (attempt <= CONFIG.maxRetries) {
+                log(`Wiederholung in ${CONFIG.retryDelayMin} Minuten...`);
+                setTimeout(() => performDailyReset(attempt + 1), CONFIG.retryDelayMin * 60000);
+            } else {
+                log("Maximale Retries erreicht.", 'error');
+            }
+        } finally {
+            isResetting = false; 
+        }
+    }
+
+    // --- INITIALISIERUNG ---
+    await initDataPoints();
+    
+    // KORREKTUR: Promise.all für mehrere getStateAsync Aufrufe verwenden
+    const [summeState, zaehlerState] = await Promise.all([
+        getStateAsync(CONFIG.paths.summe),
+        getStateAsync(CONFIG.paths.zaehler)
+    ]);
+
+    stateCache.summe = (summeState && typeof summeState.val === 'number') ? summeState.val : 0;
+    stateCache.zaehler = (zaehlerState && typeof zaehlerState.val === 'number') ? zaehlerState.val : 0;
+
+    const startStatus = await berechneHeizperiode();
+    log(`Skript v5.4 gestartet. Heizstatus: ${startStatus}. Initial-Cache: ${stateCache.summe.toFixed(2)}°C (${stateCache.zaehler} Messungen).`);
+
+    /**
+     * Trigger 1: Sensor
+     */
+    on({ id: CONFIG.sensor, change: "any" }, async (obj) => {
+        if (isResetting) return;
+        try {
+            const val = obj.state.val;
+            if (typeof val !== 'number' || val < CONFIG.limits.min || val > CONFIG.limits.max) return;
+
+            stateCache.summe += val;
+            stateCache.zaehler++;
+
+            await setStateAsync(CONFIG.paths.summe, stateCache.summe, true);
+            await setStateAsync(CONFIG.paths.zaehler, stateCache.zaehler, true);
+        } catch (e) { log(`Fehler im Sensor-Trigger: ${e.message}`, 'error'); }
+    });
+
+    /**
+     * Trigger 2: Manueller Override
+     */
+    on({ id: [CONFIG.paths.summe, CONFIG.paths.zaehler], change: "ne", ack: false }, async (obj) => {
+        if (isResetting) {
+            log("Manueller Eingriff während des Resets ignoriert.", "warn");
             return;
         }
 
-        // Hole alte Werte und addiere den neuen Wert hinzu
-        const alteSumme = (await getStateAsync(ID_ZWISCHENSPEICHER)).val || 0;
-        const alterZaehler = (await getStateAsync(ID_ZAEHLER)).val || 0;
+        let val = obj.state.val;
+        if (typeof val !== 'number') return;
+        if (val < 0) val = 0;
 
-        const neueSumme = alteSumme + aktuelleTemp;
-        const neuerZaehler = alterZaehler + 1;
-
-        // Schreibe die neuen Werte zurück in die Datenpunkte
-        await setStateAsync(ID_ZWISCHENSPEICHER, neueSumme, true);
-        await setStateAsync(ID_ZAEHLER, neuerZaehler, true);
+        if (obj.id === CONFIG.paths.summe) {
+            stateCache.summe = val;
+        } else {
+            stateCache.zaehler = Math.floor(val);
+        }
+        
+        log(`Manuelle Korrektur übernommen: ${obj.id.split('.').pop()} = ${val}`);
+        await setStateAsync(obj.id, val, true);
     });
 
     /**
-     * Trigger 2: Führt die tägliche Berechnung zur festgelegten Zeit aus (lokale Serverzeit).
-     * Berechnet den Mittelwert, setzt die Heizperiode und setzt die Speicher zurück.
-     * INFO: 02:50 MEZ (Winter) = 01:50 UTC | 02:50 MESZ (Sommer) = 00:50 UTC.
+     * Zeitplan
      */
-    // @ts-ignore
-    schedule(`${RESET_MINUTE} ${RESET_STUNDE} * * *`, async function () {
-        log("Tagesabschluss wird durchgeführt: Berechne Tagesmittel und setze Heizperiode.");
-
-        // 1. Werte aus den Datenpunkten auslesen
-        const summe = (await getStateAsync(ID_ZWISCHENSPEICHER)).val;
-        const zaehler = (await getStateAsync(ID_ZAEHLER)).val;
-
-        // 2. Tagesmittelwert berechnen (Schutz vor Division durch Null)
-        const tagesMittel = (zaehler > 0) ? (summe / zaehler) : 0;
-        await setStateAsync(ID_MITTELWERT, parseFloat(tagesMittel.toFixed(2)), true);
-        log(`Tagesmittel berechnet: ${tagesMittel.toFixed(2)}°C (Summe: ${summe.toFixed(2)}°C / Zähler: ${zaehler})`);
-
-        // 3. Zwischenspeicher, Zähler und Reset-Datum für den nächsten Tag zurücksetzen
-        await setStateAsync(ID_ZWISCHENSPEICHER, 0, true);
-        await setStateAsync(ID_ZAEHLER, 0, true);
-        
-        const jetzt = new Date();
-        const tag = String(jetzt.getDate()).padStart(2, '0');
-        const monatFormatiert = String(jetzt.getMonth() + 1).padStart(2, '0');
-        const jahr = jetzt.getFullYear();
-        const datumString = `${tag}.${monatFormatiert}.${jahr}`;
-        await setStateAsync(ID_LETZTER_RESET, datumString, true);
-
-        log("Zwischenspeicher, Zähler und Reset-Datum wurden aktualisiert.");
-
-        // 4. Heizperiode bestimmen und setzen
-        const monat = jetzt.getMonth() + 1; // getMonth() ist 0-basiert (0=Jan), daher +1
-        const istHeizZeitraum = (monat >= 10 || monat <= 5); // Oktober bis Mai
-        const istUnterHeizgrenze = (tagesMittel <= HEIZGRENZE);
-        const heizperiodeAktiv = (istUnterHeizgrenze && istHeizZeitraum);
-
-        await setStateAsync(ID_HEIZPERIODE, heizperiodeAktiv, true);
-        
-        // OPTIMIERT: Detailliertere Log-Ausgabe für bessere Nachvollziehbarkeit
-        if (!istHeizZeitraum) {
-            log(`Heizperiode gesetzt auf: ${heizperiodeAktiv}. Grund: Außerhalb des Zeitraums (Oktober-Mai).`);
-        } else if (!istUnterHeizgrenze) {
-            log(`Heizperiode gesetzt auf: ${heizperiodeAktiv}. Grund: Tagesmittel (${tagesMittel.toFixed(2)}°C) liegt über der Heizgrenze (${HEIZGRENZE}°C).`);
-        } else {
-            log(`Heizperiode gesetzt auf: ${heizperiodeAktiv}. Grund: Im Heizzeitraum und Tagesmittel (${tagesMittel.toFixed(2)}°C) unter der Heizgrenze (${HEIZGRENZE}°C).`);
-        }
-    });
+    schedule(`${CONFIG.resetTime.minute} ${CONFIG.resetTime.hour} * * *`, () => performDailyReset());
 
 })();
-
