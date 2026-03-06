@@ -38,11 +38,20 @@
         BATTERY_TYPES: {
             "HMIP-eTRV-2":   { type: "AA" },
             "HmIP-STHD":     { type: "AA" },
-            "HmIP-SWDO-I":   { type: "AAA" },
-            "HmIP-WRC2":     { type: "AAA" },
-            "HmIP-SWDO":     { type: "AAA" },
+            "HmIP-SLO":      { type: "AA" },
+            "HmIP-SPI":      { type: "AA" },
+            "HmIP-STHO-A":   { type: "AA" },
+            "HmIP-DSD-PCB":  { type: "AA" },
+            "HM-ES-TX-WM":   { type: "AA" },
+            "HmIP-STE2-PCB": { type: "AA" },
             "HmIP-SMI":      { type: "AA" },
-            "HmIP-SMO":      { type: "AA" }
+            "HmIP-SMO":      { type: "AA" },
+            "HmIP-SWDO-I":   { type: "AAA" },
+            "HmIP-SCI":      { type: "AAA" },
+            "HmIP-SWDO-PL":  { type: "AAA" },
+            "HmIP-WKP":      { type: "AAA" },
+            "HmIP-WRC":      { type: "AAA" },
+            "HmIP-WRC2":     { type: "AAA" }
         }
     };
 
