@@ -3,7 +3,7 @@
  * @version     3.4 ULTIMATE
  * @author      Sanweb
  * @description
- * Überarbeitete Version:
+ * Überarbeitete Version basierend auf Code-Analyse:
  * - Fix: Timer-Referenzierung über Objekt-Struktur.
  * - Performance: Parallele Zustandsabfragen via Promise.all.
  * - Robustheit: Try/Catch Error-Handling und Typ-Validierung.
@@ -117,17 +117,20 @@ async function setStateChangedAndLog(id, value) {
 // └────────────────────────────────────────────────────────────────────────────────────┘
 
 async function initializeDataPoints() {
+    // 'type' wurde aus dem Objekt entfernt, da ohnehin alle States boolean sind
     const statesToCreate = {
-        [STATUS_LINKS_VAR]:  { name: 'Status Bett Links (belegt/frei)', type: 'boolean', def: false, role: 'state.switch' },
-        [STATUS_RECHTS_VAR]: { name: 'Status Bett Rechts (belegt/frei)', type: 'boolean', def: false, role: 'state.switch' },
-        [AKTIV_VAR]:         { name: 'Nachtschaltung aktiv', type: 'boolean', def: false, role: 'switch' }
+        [STATUS_LINKS_VAR]:  { name: 'Status Bett Links (belegt/frei)', role: 'state.switch' },
+        [STATUS_RECHTS_VAR]: { name: 'Status Bett Rechts (belegt/frei)', role: 'state.switch' },
+        [AKTIV_VAR]:         { name: 'Nachtschaltung aktiv', role: 'switch' }
     };
 
     for (const [id, config] of Object.entries(statesToCreate)) {
         if (!(await existsStateAsync(id))) {
             log(`${LOG_PREFIX}Erstelle Datenpunkt: ${id}`, 'info');
             await createStateAsync(id, {
-                type: config.type, name: config.name, def: config.def,
+                type: 'boolean', // Hier direkt als Literal deklariert, was den Linter zufriedenstellt
+                name: config.name, 
+                def: false, // default false für alle
                 read: true, write: true, role: config.role
             });
         }
