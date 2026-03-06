@@ -1,7 +1,7 @@
 /**
  * @fileoverview Universelle, intelligente Einzelraum-Heizungssteuerung für ioBroker
- * @version 6.11 (Heizkurve entschärft & Witterungsführung im Maximum-Prinzip)
- * @author Sanweb (Optimiert durch Gemini)
+ * @version 6.14 (Heizkurve entschärft & Witterungsführung im Maximum-Prinzip)
+ * @author Sanweb
  * @license MIT
  *
  * -------------------------------------------------------------------------------------
@@ -11,15 +11,11 @@
  * Es berechnet die optimale Soll-Temperatur basierend auf Anwesenheit, Fenstersensoren,
  * physikalischen Modulen und den proaktiven Wetter-Faktoren.
  *
- * NEU in V6.11:
- * - KONFIGURATION: Heizkurvenfaktor von 0.25 auf 0.10 reduziert, um die Regelung
- * weniger aggressiv zu gestalten.
- *
- * NEU in V6.10:
- * - LOGIK-UPDATE: Die "Witterungsführung" (Heizkurve) wird nicht mehr blind aufaddiert.
- * Sie konkurriert nun als 4. Modul im "Maximum-Prinzip".
- * Das verhindert, dass Wetter-Aufschlag und Physik-Aufschlag doppelt zählen.
- * Es gewinnt der höchste notwendige Wert aus [Wetter, Schimmel, Behaglichkeit, Last].
+ * NEU in V6.14:
+ * - DOKUMENTATION: Wichtiger Hinweis zur Abhängigkeit vom ML-Skript im Header ergänzt.
+ * * HINWEIS: Dieses Skript arbeitet mit Datenpunkten zusammen, die von einem separaten 
+ * ML-Skript (Machine Learning) geschrieben werden. Ohne diese Datenpunkte funktioniert 
+ * die Wetter-Korrektur nur mit den Default-Werten (1.0).
  * -------------------------------------------------------------------------------------
  */
 
@@ -96,7 +92,7 @@
         },
 
         // --- H. DEBUG & TRIGGER-SCHWELLENWERTE ---
-        debugLogAktiv: true,
+        debugLogAktiv: false, // Im Dauerbetrieb auf false setzen, um Log-Flut zu vermeiden
         aussenTempTriggerThreshold: 1.0,
         raumTempTriggerThreshold: 0.3,
         luftfeuchteTriggerThreshold: 5.0,
@@ -114,28 +110,33 @@
     // -------------------------------------------------------------------------------------
     async function main() {
         try {
-            // --- 2.1 Alle Zustände auf einmal sammeln ---
-            const states = {};
-            const idsToFetch = { ...CONFIG.ids, ...CONFIG.devices, ...CONFIG.lernwerte };
-            for (const key in idsToFetch) {
-                const id = idsToFetch[key];
-                if (typeof id === 'string') {
-                    const state = await getStateAsync(id);
-                    states[key] = state ? state.val : null;
-                } else if (Array.isArray(id)) {
-                    states[key] = [];
-                    for (const subId of id) {
-                        const state = await getStateAsync(subId);
-                        states[key].push(state ? state.val : null);
-                    }
-                }
+            // --- 2.1 Alle Zustände explizit und sicher sammeln ---
+            const states = {
+                heizPeriode: (await getStateAsync(CONFIG.ids.heizPeriode))?.val,
+                anwesenheit: (await getStateAsync(CONFIG.ids.anwesenheit))?.val,
+                nachtschaltung: (await getStateAsync(CONFIG.ids.nachtschaltung))?.val,
+                sollTempAnwesend: (await getStateAsync(CONFIG.ids.sollTempAnwesend))?.val,
+                sollTempAbwesend: (await getStateAsync(CONFIG.ids.sollTempAbwesend))?.val,
+                tuerSensor: CONFIG.tuerSensorNutzen ? (await getStateAsync(CONFIG.devices.tuerSensor))?.val : null,
+                aussenTempSensor: (await getStateAsync(CONFIG.devices.aussenTempSensor))?.val,
+                feuchteSensor: (await getStateAsync(CONFIG.devices.feuchteSensor))?.val,
+                wandSensorOberflaeche: (await getStateAsync(CONFIG.devices.wandSensorOberflaeche))?.val,
+                wandSensorKern: (await getStateAsync(CONFIG.devices.wandSensorKern))?.val,
+                solarKorrekturId: (await getStateAsync(CONFIG.lernwerte.solarKorrekturId))?.val,
+                windKorrekturId: (await getStateAsync(CONFIG.lernwerte.windKorrekturId))?.val,
+                fensterKontakte: []
+            };
+
+            for (const subId of CONFIG.devices.fensterKontakte) {
+                states.fensterKontakte.push((await getStateAsync(subId))?.val);
             }
 
             // --- Sensoren validieren & Hilfsvariablen ---
+            // Typprüfung auf 'number' stellt sicher, dass auch der Wert 0.0 korrekt als gültig erkannt wird
             const aussenSensorOK =
-                states.aussenTempSensor !== null && states.aussenTempSensor > -30.0 && states.aussenTempSensor < 60.0;
+                typeof states.aussenTempSensor === 'number' && states.aussenTempSensor > -30.0 && states.aussenTempSensor < 60.0;
             const feuchteSensorOK =
-                states.feuchteSensor !== null && states.feuchteSensor >= 0.0 && states.feuchteSensor <= 100.0;
+                typeof states.feuchteSensor === 'number' && states.feuchteSensor >= 0.0 && states.feuchteSensor <= 100.0;
 
             let sollTempAnwesend = states.sollTempAnwesend || 21.0;
             const sollTempAbwesend = states.sollTempAbwesend || 16.0;
@@ -144,8 +145,16 @@
                 sollTempAnwesend = sollTempAbwesend;
             }
 
-            const isDoorPhysicallyClosed = states.tuerSensor === 0 || states.tuerSensor === false;
-            const fensterIstOffen = states.fensterKontakte.some(state => state === true || state === 1);
+            // V6.13: Robuste Prüfung auch auf String-Werte
+            const isDoorPhysicallyClosed = 
+                states.tuerSensor === 0 || 
+                states.tuerSensor === false || 
+                states.tuerSensor === '0' || 
+                states.tuerSensor === 'false';
+                
+            const fensterIstOffen = states.fensterKontakte.some(
+                state => state === true || state === 1 || state === 'true' || state === '1'
+            );
 
             // --- Log-Strings vorbereiten ---
             let logModuleAction = '';
@@ -178,14 +187,16 @@
 
             // --- 4. LOGIK: Dynamische Anpassungen & Module ---
             if (!istSonderfall) {
-                // --- 4.1 Feuchtekorrektur (Bleibt additiv) ---
-                if (feuchteSensorOK) {
+                // --- 4.1 Feuchtekorrektur (Bleibt additiv, greift aber nur bei Abwesenheit) ---
+                if (feuchteSensorOK && !states.anwesenheit) {
                     neueSollTemp +=
                         (CONFIG.basisRegelung.luftfeuchteOptimal - states.feuchteSensor) *
                         CONFIG.basisRegelung.feuchteKorrekturfaktor;
                 }
 
                 // --- 4.2 Wetter-Analyse (Solar/Wind) - bleibt additiv ---
+                // Hinweis: Solar/Wind reagieren proaktiv auf aktuelle Gegebenheiten. Die nachfolgenden 
+                // Physik-Module und die Heizkurve berechnen ihren Aufschlag weiterhin auf die reine 'basisSollTemp'.
                 let maxSolarFaktor = 0;
                 let maxWindFaktor = 1.0;
 
@@ -201,8 +212,8 @@
                     }
                 }
 
-                const gelernteSolarKorrektur = states.solarKorrekturId !== null ? states.solarKorrekturId : 1.0;
-                const gelernterWindKorrektur = states.windKorrekturId !== null ? states.windKorrekturId : 1.0;
+                const gelernteSolarKorrektur = typeof states.solarKorrekturId === 'number' ? states.solarKorrekturId : 1.0;
+                const gelernterWindKorrektur = typeof states.windKorrekturId === 'number' ? states.windKorrekturId : 1.0;
 
                 if (maxSolarFaktor > 0) {
                     const solarOffset = -1.0 * maxSolarFaktor;
@@ -233,15 +244,15 @@
                 }
 
                 const wandSensorOberflaecheOK =
-                    states.wandSensorOberflaeche !== null && states.wandSensorOberflaeche < 90.0;
+                    typeof states.wandSensorOberflaeche === 'number' && states.wandSensorOberflaeche < 90.0;
 
                 // Kandidat B: Schimmelschutz
                 // Wir nutzen hier 'basisSollTemp' für die Berechnung
                 if (CONFIG.module.schimmelSchutzAktiv && feuchteSensorOK && wandSensorOberflaecheOK) {
-                    const a = 7.5,
-                        b = 237.3;
-                    const sdd = (a * basisSollTemp) / (b + basisSollTemp) + Math.log(states.feuchteSensor / 100);
-                    const taupunkt = (b * sdd) / (a - sdd);
+                    const MAGNUS_A = 7.5;
+                    const MAGNUS_B = 237.3;
+                    const sdd = (MAGNUS_A * basisSollTemp) / (MAGNUS_B + basisSollTemp) + Math.log(states.feuchteSensor / 100);
+                    const taupunkt = (MAGNUS_B * sdd) / (MAGNUS_A - sdd);
                     if (states.wandSensorOberflaeche < taupunkt + CONFIG.module.sicherheitsabstandTaupunkt) {
                         aufschlagSchimmel = CONFIG.module.offsetSchimmelSchutz;
                     }
@@ -255,7 +266,7 @@
                 }
 
                 // Kandidat D: Heizlast
-                const wandSensorKernOK = states.wandSensorKern !== null && states.wandSensorKern < 90.0;
+                const wandSensorKernOK = typeof states.wandSensorKern === 'number' && states.wandSensorKern < 90.0;
                 if (CONFIG.module.heizlastAktiv && wandSensorOberflaecheOK && wandSensorKernOK) {
                     const tempDifferenz = states.wandSensorKern - states.wandSensorOberflaeche;
                     if (tempDifferenz > 0) {
@@ -426,7 +437,10 @@
     const raumTempIds = CONFIG.devices.thermostate.map(id => id.replace('SET_POINT_TEMPERATURE', 'ACTUAL_TEMPERATURE'));
     lowPriorityTriggerIds.push(...raumTempIds);
 
-    on({ id: lowPriorityTriggerIds, change: 'ne' }, obj => {
+    function handleLowPriorityTrigger(obj) {
+        // Ignorieren, wenn sich der Wert nicht wirklich geändert hat (ersetzt das 'change: ne' Flag)
+        if (obj && obj.state && obj.oldState && obj.state.val === obj.oldState.val) return;
+
         // Bei Temperatur-Triggern prüfen wir zusätzlich den Schwellenwert
         const isTempTrigger = raumTempIds.includes(obj.id);
         if (isTempTrigger) {
@@ -440,7 +454,9 @@
         } else {
             triggerCalculation(false);
         }
-    });
+    }
+
+    on(lowPriorityTriggerIds, handleLowPriorityTrigger);
 
     // --- Periodische und initiale Trigger ---
     schedule('1,16,31,46 * * * *', () => triggerCalculation(false));
