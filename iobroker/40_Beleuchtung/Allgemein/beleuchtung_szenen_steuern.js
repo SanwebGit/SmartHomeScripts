@@ -2,13 +2,15 @@
  * Script:       Astro Szenen Steuerung
  * Description:  Steuert Smart Home Szenen (Tag, Nacht, Aus) basierend auf 
  * dem Astro-Status und der aktuellen Uhrzeit.
- * Version:      1.0.0
+ * Version:      1.2.1
  * Author:       Sanweb
  * Datum:        2026-03-09
  * * Changelog:
+ * 1.2.1  - Typen-Normalisierung in setIfChanged hinzugefügt für sichereren Vergleich.
+ * 1.2.0  - Prüfung des Ist-Zustandes vor dem Schalten hinzugefügt (schont den ioBroker Bus/Funkverkehr).
  * 1.1.1  - Eindeutiger Log-Prefix hinzugefügt für bessere Übersicht im ioBroker-Log.
  * 1.1.0  - Konfiguration in ein zentrales CONFIG-Objekt ausgelagert (Refactoring).
- * 1.0.0  - Initiale Version (Portierung aus Node-RED)
+ * 1.0.0  - Initiale Version
  * inkl. RBE (Report By Exception) und robuster Fehlerprüfung.
  ********************************************************************************/
 
@@ -53,6 +55,37 @@ function initializeLastScene() {
 
 // Dann aufrufen:
 initializeLastScene();
+
+// ==========================================
+// Hilfsfunktionen
+// ==========================================
+
+// Schaltet einen Datenpunkt nur, wenn der neue Wert vom aktuellen Ist-Wert abweicht.
+// Das reduziert unnötigen Schaltverkehr im Smart Home Netzwerk.
+function setIfChanged(id, targetValue) {
+    if (!existsState(id)) {
+        log(`${CONFIG.LOG_PREFIX}Datenpunkt existiert nicht, kann nicht schalten: ${id}`, "warn");
+        return;
+    }
+    
+    const currentState = getState(id).val;
+    
+    // Typen normalisieren für sicheren Vergleich
+    const normalizedCurrent = typeof currentState === 'boolean' ? currentState :
+                              currentState === 'true' || currentState === 1 ? true :
+                              currentState === 'false' || currentState === 0 ? false :
+                              currentState;
+                              
+    const normalizedTarget = typeof targetValue === 'boolean' ? targetValue :
+                             targetValue === 'true' || targetValue === 1 ? true :
+                             targetValue === 'false' || targetValue === 0 ? false :
+                             targetValue;
+
+    if (normalizedCurrent !== normalizedTarget) {
+        log(`${CONFIG.LOG_PREFIX}Schalte ${id} von ${currentState} auf ${targetValue}`, "debug");
+        setState(id, targetValue, false); // ack: false explizit gesetzt für Steuerbefehle
+    }
+}
 
 // ==========================================
 // Hauptlogik
@@ -113,7 +146,7 @@ function checkAstroScene() {
     }
 
     // Debug-Logging für bessere Fehlersuche
-    log(`${CONFIG.LOG_PREFIX}Prüfung: Astro=${astroStatus}, Zeit=${currentHours}:${currentMinutes}, Aktuelle Szene=${currentSceneName}, Letzte Szene=${lastScene}`, "debug");
+    log(`${CONFIG.LOG_PREFIX}Prüfung: Astro=${astroStatus}, Zeit=${currentHours}:${currentMinutes}, Aktuelle Szene=${currentSceneName}, Letzte Szene=${lastScene}`, "info");
 
     // --- RBE (Report By Exception) ---
     // Wir senden nur Befehle, wenn sich die aktive Szene ändert
@@ -121,10 +154,10 @@ function checkAstroScene() {
         lastScene = currentSceneName;
         log(`${CONFIG.LOG_PREFIX}Status-Änderung erkannt: Aktiviere Szene -> ${currentSceneName}`);
 
-        // Ausgänge schalten (ack: false explizit gesetzt für Steuerbefehle)
-        setState(CONFIG.SCENES.TAG, valTag, false);
-        setState(CONFIG.SCENES.NACHT, valNacht, false);
-        setState(CONFIG.SCENES.AUS, valAus, false);
+        // Ausgänge nur schalten, wenn sich der Wert wirklich ändert (schont den Funkverkehr)
+        setIfChanged(CONFIG.SCENES.TAG, valTag);
+        setIfChanged(CONFIG.SCENES.NACHT, valNacht);
+        setIfChanged(CONFIG.SCENES.AUS, valAus);
     }
 }
 
@@ -132,12 +165,12 @@ function checkAstroScene() {
 // Trigger
 // ==========================================
 
-// 1. Trigger: Bei jeder Änderung des Astro-Datenpunkts (entspricht "ioBroker in" Node)
+// 1. Trigger: Bei jeder Änderung des Astro-Datenpunkts
 on({ id: CONFIG.ASTRO_ID, change: "ne" }, function (obj) {
     checkAstroScene();
 });
 
-// 2. Trigger: Zeitplan alle 5 Minuten (entspricht "inject" Node mit repeat: 300)
+// 2. Trigger: Zeitplan alle 5 Minuten
 // Dieser Intervall-Check stellt sicher, dass zeitbasierte Wechsel (z.B. um 22:30 Uhr)
 // zuverlässig ausgelöst werden, auch wenn der Astro-Status ("Nacht") sich nicht ändert.
 schedule("*/5 * * * *", function () {
