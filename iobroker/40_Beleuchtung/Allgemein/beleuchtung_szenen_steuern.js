@@ -2,18 +2,17 @@
  * Script:       Astro Szenen Steuerung
  * Description:  Steuert Smart Home Szenen (Tag, Nacht, Aus) basierend auf 
  * dem Astro-Status und der aktuellen Uhrzeit.
- * Version:      1.4.1
+ * Version:      1.3.0
  * Author:       Sanweb
  * Datum:        2026-03-09
  * * Changelog:
- * 1.4.1  - Feste scenes-Adapter Instanz (scenes.0) im CONFIG definiert (Bugfix für Instanz-Name).
- * 1.4.0  - Umstellung auf sendTo() für das Aktivieren/Deaktivieren von Szenen.
- * 1.3.0  - Rollback auf Logik 1.1.1, Typen-Normalisierung für Initialisierung.
- * 1.2.1  - Typen-Normalisierung in setIfChanged hinzugefügt.
- * 1.2.0  - Prüfung des Ist-Zustandes vor dem Schalten.
- * 1.1.1  - Eindeutiger Log-Prefix.
- * 1.1.0  - Konfiguration in ein zentrales CONFIG-Objekt ausgelagert.
- * 1.0.0  - Initiale Version (Portierung aus Node-RED).
+ * 1.3.0  - Rollback auf Logik 1.1.1 (Verzicht auf Einzelprüfung/setIfChanged vor dem Schalten), 
+ * Typen-Normalisierung als Hilfsfunktion für die Initialisierung beibehalten.
+ * 1.2.1  - Typen-Normalisierung in setIfChanged hinzugefügt für sichereren Vergleich.
+ * 1.2.0  - Prüfung des Ist-Zustandes vor dem Schalten hinzugefügt (schont den ioBroker Bus/Funkverkehr).
+ * 1.1.1  - Eindeutiger Log-Prefix hinzugefügt für bessere Übersicht im ioBroker-Log.
+ * 1.1.0  - Konfiguration in ein zentrales CONFIG-Objekt ausgelagert (Refactoring).
+ * 1.0.0  - Initiale Version
  ********************************************************************************/
 
 (function() {
@@ -25,7 +24,6 @@
 const CONFIG = {
     LOG_PREFIX: "[Astro-Szenen] ", // Eindeutige Bezeichnung für das Logbuch
     ASTRO_ID: "0_userdata.0.System.Astro.TagNacht",
-    SCENES_ADAPTER: "scenes.0",    // Die Instanz des Szenen-Adapters für sendTo()
     SCENES: {
         TAG: "scene.0.Automatisches Licht.Astro_Tag",
         NACHT: "scene.0.Automatisches Licht.Astro_Nacht",
@@ -66,25 +64,6 @@ function initializeLastScene() {
 
 // Dann aufrufen:
 initializeLastScene();
-
-// ==========================================
-// Hilfsfunktionen
-// ==========================================
-
-// Aktiviert oder deaktiviert eine Szene über den offiziellen sendTo-Befehl des Adapters
-function setSceneState(sceneId, isActive) {
-    const command = isActive ? 'enable' : 'disable';
-    
-    // Sendet den Befehl an die zentrale Adapter-Instanz (z.B. "scenes.0")
-    sendTo(CONFIG.SCENES_ADAPTER, command, sceneId, result => {
-        if (result && result.err) {
-            log(`${CONFIG.LOG_PREFIX}Fehler bei '${command}' für ${sceneId}: ${result.err}`, "error");
-        } else {
-            // Optionales Debug-Log, um den erfolgreichen sendTo-Befehl zu verfolgen
-            log(`${CONFIG.LOG_PREFIX}Befehl '${command}' erfolgreich an ${sceneId} gesendet.`, "debug");
-        }
-    });
-}
 
 // ==========================================
 // Hauptlogik
@@ -153,11 +132,10 @@ function checkAstroScene() {
         lastScene = currentSceneName;
         log(`${CONFIG.LOG_PREFIX}Status-Änderung erkannt: Aktiviere Szene -> ${currentSceneName}`);
 
-        // Ausgänge über den offiziellen sendTo-Befehl an die zentrale Instanz schalten
-        // Dies führt dazu, dass EINE Szene ein "enable" bekommt und ZWEI ein "disable"
-        setSceneState(CONFIG.SCENES.TAG, valTag);
-        setSceneState(CONFIG.SCENES.NACHT, valNacht);
-        setSceneState(CONFIG.SCENES.AUS, valAus);
+        // Ausgänge schalten (ack: false explizit gesetzt für Steuerbefehle)
+        setState(CONFIG.SCENES.TAG, valTag, false);
+        setState(CONFIG.SCENES.NACHT, valNacht, false);
+        setState(CONFIG.SCENES.AUS, valAus, false);
     }
 }
 
