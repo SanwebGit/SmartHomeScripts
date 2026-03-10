@@ -1,258 +1,493 @@
 /**
  * @fileoverview Wetterdaten-Analyse-Skript für proaktive Heizungssteuerung
- * @version 3.0 (Final)
+ * @version 5.2 (Micro-Optimized)
  * @author Sanweb
  * @license MIT
  *
  * -------------------------------------------------------------------------------------
  * ZWECK DES SKRIPTS:
  * -------------------------------------------------------------------------------------
- * Dieses Skript ist die zentrale Intelligenz-Schicht für die Wetteranalyse. Es ermittelt
- * proaktiv den Einfluss von Sonne und Wind auf das Gebäude und berechnet daraus
- * richtungsspezifische Faktoren. Diese Faktoren werden von den Einzelraum-Regelungs-
- * skripten genutzt, um die Heizungs-Soll-Temperatur vorausschauend anzupassen.
+ * Zentrale Intelligenz-Schicht für die Wetteranalyse. Ermittelt proaktiv den Einfluss 
+ * von Sonne und Wind auf das Gebäude und berechnet richtungsspezifische Faktoren.
  *
- * -------------------------------------------------------------------------------------
- * KERNFUNKTIONEN:
- * -------------------------------------------------------------------------------------
- * 1. PHYSIKALISCHES SOLAR-MODELL: Der solare Gewinn wird nicht nur pauschal erfasst,
- * sondern mit dem Sinus der Sonnenhöhe gewichtet. Dies bildet die tatsächliche
- * Energieintensität bei flachem Einfallswinkel (Morgen-/Abendsonne) physikalisch
- * korrekt ab und verhindert eine Überbewertung.
- *
- * 2. DETAILLIERTE SONNENSTANDS-PRÜFUNG: Der solare Gewinn wird nur berechnet, wenn die
- * Sonne eine in der Konfiguration definierte Mindesthöhe und einen bestimmten
- * Winkelbereich (Azimut) erreicht. Dies ermöglicht die präzise Berücksichtigung
- * von Hindernissen wie Nachbargebäuden oder Bäumen.
- *
- * 3. ERWEITERTES WIND-MODELL: Berücksichtigt nicht nur den direkten Winddruck
- * (Luv-Seite), sondern auch die indirekte Auskühlung an windabgewandten Seiten
- * durch Sog-Effekte (Lee-Seite), um eine Gesamtauskühlung des Gebäudes abzubilden.
- *
- * 4. ROBUSTHEIT: Das Skript stürzt nicht ab, wenn die 'suncalc'-Bibliothek fehlt,
- * sondern gibt eine klare Fehlermeldung aus und überspringt lediglich die Solar-Analyse.
- *
- * -------------------------------------------------------------------------------------
- * VORAUSSETZUNGEN & EMPFEHLUNGEN:
- * -------------------------------------------------------------------------------------
- * - Die 'suncalc'-Bibliothek muss im JavaScript-Adapter eingetragen sein.
- * - Empfohlene Ausführungshäufigkeit: Alle 5 bis 15 Minuten.
+ * NEU IN V5.2 (Micro-Optimierungen):
+ * - Dämmerungserkennung dynamisch über Sonnenhöhe (< 15°) statt fester Uhrzeiten
+ * - Asynchrone Batch-Updates (Promise.all) für minimierte I/O-Latenz
+ * - Start-Validierung der Konfiguration (validateConfig)
+ * * NEU IN V5.4 (System-Integration):
+ * - Automatisches Laden der Längen- und Breitengrade aus der ioBroker Systemkonfiguration
  */
 
-(function(){ // Start der Kapselung, um globale Variablen zu vermeiden
+(function() { // Start der Kapselung
     "use strict";
 
-// --- Robustheits-Prüfung: suncalc-Bibliothek laden ---
-let suncalc;
-let suncalcAvailable = false;
-try {
-    // @ts-ignore
-    suncalc = require('suncalc');
-    suncalcAvailable = true;
-} catch (e) {
-    log('[Wetter-Analyse] FEHLER: Die "suncalc"-Bibliothek wurde nicht im JavaScript-Adapter gefunden. Die Solar-Analyse wird übersprungen.', 'error');
-}
+    // -------------------------------------------------------------------------------------
+    // 1. ZENTRALE KONFIGURATION
+    // -------------------------------------------------------------------------------------
+    const CONFIG = {
+        // --- A. GRUNDEINSTELLUNGEN ---
+        debugLogAktiv: true,
+        autoCreateStates: true,
 
+        // --- B. STEUERUNG ---
+        steuerung: {
+            updateIntervall: '*/15 * * * *', // Cron-Job Intervall
+            startVerzoegerungMs: 5000,       // Verzögerung beim ersten Start
+        },
 
-// -------------------------------------------------------------------------------------
-// 1. ZENTRALE KONFIGURATION
-// -------------------------------------------------------------------------------------
-const CONFIG = {
-    // --- A. GRUNDEINSTELLUNGEN ---
-    debugLogAktiv: true,
-    autoCreateStates: true,
+        // --- C. STANDORT-KONFIGURATION ---
+        // Wenn null, wird automatisch der Standort aus den ioBroker-Haupteinstellungen geladen.
+        standort: {
+            breitengrad: null, // Optionaler Fallback, z.B. 52.042402
+            laengengrad: null, // Optionaler Fallback, z.B. 8.488758
+        },
 
-    // --- B. STANDORT-KONFIGURATION (WICHTIG & ERFORDERLICH) ---
-    // Exakte Koordinaten sind für eine genaue Sonnenstandsberechnung unerlässlich.
-    standort: {
-        breitengrad: 52.042402075167075,
-        laengengrad: 8.48875812214296,
-    },
+        // --- D. SCHWELLWERTE & DYNAMIK ---
+        schwellwerte: {
+            // Solar
+            minSolarstrahlung: 50,        // Mindeststrahlung in W/m² für Solaranalyse
+            maxSolarstrahlung: 1000,      // Maximalwert in W/m² für Normierung (Bewölkungsfaktor)
+            grenzeSonnig: 600,            // Ab dieser Strahlung gilt es als "Sonnig"
+            grenzeTeilsBewoelkt: 200,     // Ab dieser Strahlung gilt es als "Teils bewölkt"
+            solarGlaettungsfaktor: 0.4,   // 0 = sehr träge, 1 = sofortige Übernahme
+            hystereseSolar: 0.05,         // Mindeständerung des Faktors vor neuem Schreiben
+            
+            // Wind
+            minWindgeschwindigkeit: 5,    // Wind ab dieser Geschw. in km/h berücksichtigen
+            maxWindgeschwindigkeit: 65,   // Maximalwert in km/h für Normierung des Windfaktors
+            windGlaettungsfaktor: 0.3,    // 0 = sehr träge, 1 = sofortige Übernahme
+            hystereseWind: 0.05,          // Mindeständerung des Faktors vor neuem Schreiben
+        },
 
-    // --- C. PHYSIKALISCHE MODELLE ---
-    // Faktor für die indirekte Auskühlung an nicht direkt vom Wind getroffenen Wänden.
-    // Ein Wert von 0.25 bedeutet, dass diese Wände 25% des Auskühlungseffekts der Hauptwindrichtung erfahren.
-    windAbschwaechung: 0.25,
+        // --- E. GEBÄUDEEIGENSCHAFTEN ---
+        gebaeude: {
+            waermekapazitaet: 0.8,        // Trägheit des Gebäudes (0-1)
+            daemmstandard: 0.5,           // Dämmung (0=schlecht, 1=sehr gut)
+            windAbschwaechung: 0.25,      // Auskühlung an nicht direkt vom Wind getroffenen Wänden
+        },
 
-    // --- D. KONFIGURATION DER FENSTER UND SONNENEINSTRAHLUNG ---
-    // Tipp: Nutzen Sie eine Webseite wie suncalc.org, um den Sonnenverlauf an Ihrem Standort
-    // zu visualisieren und die Winkel für Ihre Fenster präzise zu bestimmen.
-    fensterAusrichtung: {
-        // minHoehe: Mindesthöhe in Grad, die die Sonne haben muss (um über Hindernisse zu scheinen).
-        // azimutVon/Bis: Winkelbereich in Grad (0°=N, 90°=O, 180°=S, 270°=W), in dem die Sonne das Fenster trifft.
-        'Sued':  { minHoehe: 12, azimutVon: 130, azimutBis: 230 },
-        'West':  { minHoehe: 10,  azimutVon: 230, azimutBis: 280 },
-        'Ost':   { minHoehe: 10,  azimutVon: 80,  azimutBis: 130 },
-        'Nord':  { minHoehe: 15, azimutVon: 330, azimutBis: 30 } // Bereich über 360/0 Grad wird korrekt behandelt
-    },
+        // --- F. KONFIGURATION DER FENSTER UND SONNENEINSTRAHLUNG ---
+        fensterAusrichtung: {
+            'Sued':  { minHoehe: 12, azimutVon: 130, azimutBis: 230 },
+            'West':  { minHoehe: 10, azimutVon: 230, azimutBis: 280 },
+            'Ost':   { minHoehe: 10, azimutVon: 80,  azimutBis: 130 },
+            'Nord':  { minHoehe: 15, azimutVon: 330, azimutBis: 30 } 
+        },
 
-    // --- E. INPUT-IDs: WETTERSTATION ---
-    weatherIds: {
-        solarradiation: '0_userdata.0.Wetter.solarradiation',
-        windspeed: '0_userdata.0.Wetter.windspeed',
-        winddir: '0_userdata.0.Wetter.winddir',
-    },
+        // --- G. INPUT-IDs: WETTERSTATION ---
+        weatherIds: {
+            solarradiation: '0_userdata.0.Wetter.solarradiation',
+            windspeed: '0_userdata.0.Wetter.windspeed',
+            winddir: '0_userdata.0.Wetter.winddir',
+        },
 
-    // --- F. OUTPUT-IDs: ZIEL-DATENPUNKTE ---
-    outputIds: {
-        aktuellerZustand: '0_userdata.0.Heizung.Analyse.Wetter_AktuellerZustand',
-        basisPfadSolar: '0_userdata.0.Heizung.Analyse.Wetter_Heizunterstuetzung_Solar',
-        basisPfadWind: '0_userdata.0.Heizung.Analyse.Wetter_Waermeverlust_Wind',
-    },
-};
+        // --- H. OUTPUT-IDs: ZIEL-DATENPUNKTE ---
+        outputIds: {
+            aktuellerZustand: '0_userdata.0.Heizung.Analyse.Wetter_AktuellerZustand',
+            basisPfadSolar: '0_userdata.0.Heizung.Analyse.Wetter_Heizunterstuetzung_Solar',
+            basisPfadWind: '0_userdata.0.Heizung.Analyse.Wetter_Waermeverlust_Wind',
+        },
+    };
 
-// -------------------------------------------------------------------------------------
-// 2. SKRIPT-INITIALISIERUNG
-// -------------------------------------------------------------------------------------
-async function createStates() {
-    if (!CONFIG.autoCreateStates) return;
-    if (CONFIG.debugLogAktiv) log('[Wetter-Analyse] Prüfe und erstelle Datenpunkte...');
-
-    const idZustand = CONFIG.outputIds.aktuellerZustand;
-    if (!(await existsStateAsync(idZustand))) {
-        await createStateAsync(idZustand, 'unbekannt', { name: 'Wetter: Aktueller Zustand', type: 'string', role: 'text', def: 'unbekannt', read: true, write: false });
-    }
-
-    const richtungen = ['Nord', 'Ost', 'Sued', 'West'];
-    for (const richtung of richtungen) {
-        const solarId = `${CONFIG.outputIds.basisPfadSolar}_${richtung}`;
-        if (!(await existsStateAsync(solarId))) {
-            await createStateAsync(solarId, 0, { name: `Wetter: Heizunterstützung Solar ${richtung}`, type: 'number', role: 'value', unit: 'Faktor', def: 0, read: true, write: false });
+    // -------------------------------------------------------------------------------------
+    // 2. HILFSKLASSE: HYSTERESE MIT PERSISTENZ & I/O-OPTIMIERUNG
+    // -------------------------------------------------------------------------------------
+    class WertMitHysterese {
+        constructor(minAenderung = 0.05, stateId = null) {
+            this.minAenderung = minAenderung;
+            this.stateId = stateId;
+            this.letzterWert = null;
         }
-        const windId = `${CONFIG.outputIds.basisPfadWind}_${richtung}`;
-        if (!(await existsStateAsync(windId))) {
-            await createStateAsync(windId, 1, { name: `Wetter: Wärmeverlust Wind ${richtung}`, type: 'number', role: 'value', unit: 'Faktor', def: 1, read: true, write: false });
-        }
-    }
-}
-
-// -------------------------------------------------------------------------------------
-// 3. DATENBESCHAFFUNG & HILFSFUNKTIONEN
-// -------------------------------------------------------------------------------------
-async function getCurrentData() {
-    const data = {};
-    for (const key in CONFIG.weatherIds) {
-        const state = await getStateAsync(CONFIG.weatherIds[key]);
-        data[key] = state ? state.val : null;
-    }
-    return data;
-}
-
-function gradToHimmelsrichtung(deg) {
-    if (deg === null || typeof deg === 'undefined') return 'Nord';
-    if (deg > 315 || deg <= 45) return 'Nord';
-    if (deg > 45 && deg <= 135) return 'Ost';
-    if (deg > 135 && deg <= 225) return 'Sued';
-    if (deg > 225 && deg <= 315) return 'West';
-    return 'Nord';
-}
-
-// -------------------------------------------------------------------------------------
-// 4. ANALYSE-SCHICHTEN
-// -------------------------------------------------------------------------------------
-function analyseCurrentData(data) {
-    // --- Windanalyse ---
-    const waermeverlustWind = { Nord: 1.0, Ost: 1.0, Sued: 1.0, West: 1.0 };
-    if (data.winddir !== null && data.windspeed > 5) {
-        const windRichtung = gradToHimmelsrichtung(data.winddir);
-        const zusaetzlicherFaktor = ((data.windspeed || 0) / 65);
         
-        waermeverlustWind[windRichtung] = 1 + zusaetzlicherFaktor;
-
-        const richtungen = ['Nord', 'Ost', 'Sued', 'West'];
-        for (const r of richtungen) {
-            if (r !== windRichtung) {
-                waermeverlustWind[r] = 1 + (zusaetzlicherFaktor * CONFIG.windAbschwaechung);
-            }
-        }
-    }
-    
-    // --- Solaranalyse ---
-    const heizunterstuetzungSolar = { Nord: 0.0, Ost: 0.0, Sued: 0.0, West: 0.0 };
-    if (suncalcAvailable && data.solarradiation > 50) {
-        const now = new Date();
-        const sunPos = suncalc.getPosition(now, CONFIG.standort.breitengrad, CONFIG.standort.laengengrad);
-        
-        const sunAltitudeDeg = sunPos.altitude * 180 / Math.PI;
-        if (sunAltitudeDeg > 0) {
-            let sunAzimutDeg = (sunPos.azimuth * 180 / Math.PI) + 180;
-            if (sunAzimutDeg >= 360) sunAzimutDeg -= 360;
-
-            for (const richtung in CONFIG.fensterAusrichtung) {
-                const fenster = CONFIG.fensterAusrichtung[richtung];
-                const isAzimutInNordRange = (fenster.azimutVon > fenster.azimutBis) && (sunAzimutDeg >= fenster.azimutVon || sunAzimutDeg <= fenster.azimutBis);
-                const isAzimutInNormalRange = (fenster.azimutVon <= fenster.azimutBis) && (sunAzimutDeg >= fenster.azimutVon && sunAzimutDeg <= fenster.azimutBis);
-
-                if (sunAltitudeDeg >= fenster.minHoehe && (isAzimutInNormalRange || isAzimutInNordRange)) {
-                    const basisSolarFaktor = Math.min(1, Math.max(0, (data.solarradiation || 0) / 800));
-                    const gewichteterSolarFaktor = basisSolarFaktor * Math.sin(sunPos.altitude);
-                    
-                    heizunterstuetzungSolar[richtung] = gewichteterSolarFaktor;
+        async init() {
+            if (this.stateId && (await existsStateAsync(this.stateId))) {
+                const state = await getStateAsync(this.stateId);
+                if (state && state.val !== null && !isNaN(state.val)) {
+                    this.letzterWert = parseFloat(state.val);
                 }
             }
         }
+
+        async aktualisierenUndSpeichern(neuerWert) {
+            let geaendert = false;
+            
+            // Prüfen, ob eine Änderung außerhalb der Hysterese vorliegt
+            if (this.letzterWert === null || Math.abs(neuerWert - this.letzterWert) > this.minAenderung) {
+                this.letzterWert = neuerWert;
+                geaendert = true;
+                
+                // Nur bei echter Änderung den State beschreiben (I/O Optimierung)
+                if (this.stateId) {
+                    await setStateAsync(this.stateId, parseFloat(neuerWert.toFixed(3)), true);
+                }
+            }
+            
+            return { 
+                wert: parseFloat(this.letzterWert.toFixed(3)), 
+                geaendert: geaendert 
+            };
+        }
     }
 
-    // --- Zustandstext ---
-    let zustand = data.solarradiation > 400 ? 'Sonnig' : 'Bedeckt';
-    zustand += data.windspeed > 25 ? ' & windig' : (data.windspeed < 5 ? ' & windstill' : ' & mäßiger Wind');
+    // -------------------------------------------------------------------------------------
+    // 3. HAUPTKLASSE: WETTER ANALYSE
+    // -------------------------------------------------------------------------------------
+    class WetterAnalyse {
+        constructor(config) {
+            this.config = config;
+            this.suncalc = null;
+            this.suncalcAvailable = false;
+            
+            // Caching
+            this.cachedSunPosition = null;
+            this.lastSunCalcTime = 0;
+            this.richtungsCache = new Map();
+            
+            // Einheitliche Datenstruktur für Glättungsspeicher
+            this.richtungen = ['Nord', 'Ost', 'Sued', 'West'];
+            this.faktoren = {
+                wind: { Nord: 1.0, Ost: 1.0, Sued: 1.0, West: 1.0 },
+                solar: { Nord: 0.0, Ost: 0.0, Sued: 0.0, West: 0.0 }
+            };
 
-    return {
-        aktuellerZustand: zustand,
-        heizunterstuetzungSolar: heizunterstuetzungSolar,
-        waermeverlustWind: waermeverlustWind,
-    };
-}
+            // Memory-Optimierung: Wiederverwendbare Objekte für die Analyse
+            this.tempObjekte = {
+                windRoh: { Nord: 1.0, Ost: 1.0, Sued: 1.0, West: 1.0 },
+                solarRoh: { Nord: 0.0, Ost: 0.0, Sued: 0.0, West: 0.0 }
+            };
+            
+            // Hysterese-Instanzen
+            this.hystereseSolar = {};
+            this.hystereseWind = {};
+        }
 
-// -------------------------------------------------------------------------------------
-// 5. HAUPTFUNKTION & STEUERUNG
-// -------------------------------------------------------------------------------------
-async function runAnalysis() {
-    if (CONFIG.debugLogAktiv) {
-        log(`[Wetter-Analyse] Starte Analyse V${"3.0 (Final)"}. Standort: ${CONFIG.standort.breitengrad}, ${CONFIG.standort.laengengrad}`);
+        // --- Logging ---
+        /**
+         * @param {string} message 
+         * @param {'info' | 'warn' | 'error' | 'debug' | 'silly'} level 
+         */
+        debugLog(message, level = 'info') {
+            if (this.config.debugLogAktiv) {
+                log(`[Wetter-Analyse] ${message}`, level);
+            }
+        }
+
+        // --- Initialisierung & Validierung ---
+        async loadSystemLocation() {
+            // Nur laden, wenn sie nicht manuell in der CONFIG überschrieben wurden
+            if (!this.config.standort.breitengrad || !this.config.standort.laengengrad) {
+                try {
+                    const systemConfig = await getObjectAsync('system.config');
+                    if (systemConfig && systemConfig.common && systemConfig.common.latitude && systemConfig.common.longitude) {
+                        this.config.standort.breitengrad = Number(systemConfig.common.latitude);
+                        this.config.standort.laengengrad = Number(systemConfig.common.longitude);
+                        log(`[Wetter-Analyse] Standort automatisch aus ioBroker-Systemkonfiguration geladen: ${this.config.standort.breitengrad}, ${this.config.standort.laengengrad}`, 'info');
+                    } else {
+                        throw new Error('Keine Koordinaten in system.config gefunden.');
+                    }
+                } catch (e) {
+                    log(`[Wetter-Analyse] Warnung: Konnte Standort nicht aus ioBroker laden (${e.message}). Bitte in CONFIG eintragen!`, 'warn');
+                }
+            } else {
+                log('[Wetter-Analyse] Verwende manuell konfigurierte Standortdaten aus dem Skript.', 'info');
+            }
+        }
+
+        validateConfig() {
+            const requiredStandort = ['breitengrad', 'laengengrad'];
+            for (const field of requiredStandort) {
+                if (this.config.standort[field] === undefined || this.config.standort[field] === null) {
+                    throw new Error(`Standort-Konfiguration fehlt: ${field}`);
+                }
+            }
+            
+            if (this.config.schwellwerte.minSolarstrahlung >= this.config.schwellwerte.maxSolarstrahlung) {
+                log('[Wetter-Analyse] Warnung: minSolarstrahlung sollte kleiner als maxSolarstrahlung sein', 'warn');
+            }
+        }
+
+        async init() {
+            this.debugLog('Initialisiere Wetter-Analyse V5.4...');
+            
+            await this.loadSystemLocation();
+            this.validateConfig();
+            this.initSuncalc();
+            await this.createStates();
+            await this.initHysterese();
+
+            // Initiale Glättungswerte aus States laden
+            for (const r of this.richtungen) {
+                if (this.hystereseWind[r].letzterWert !== null) this.faktoren.wind[r] = this.hystereseWind[r].letzterWert;
+                if (this.hystereseSolar[r].letzterWert !== null) this.faktoren.solar[r] = this.hystereseSolar[r].letzterWert;
+            }
+
+            // Schedule einrichten
+            schedule(this.config.steuerung.updateIntervall, () => this.run());
+            
+            // Erster Start
+            setTimeout(() => this.run(), this.config.steuerung.startVerzoegerungMs);
+        }
+
+        initSuncalc() {
+            try {
+                // @ts-ignore
+                this.suncalc = require('suncalc');
+                this.suncalcAvailable = true;
+                this.debugLog('suncalc-Bibliothek erfolgreich geladen.');
+            } catch (e) {
+                log('[Wetter-Analyse] FEHLER: Die "suncalc"-Bibliothek wurde nicht im JavaScript-Adapter gefunden. Solar-Analyse wird übersprungen.', 'error');
+            }
+        }
+
+        async createStates() {
+            if (!this.config.autoCreateStates) return;
+
+            const idZustand = this.config.outputIds.aktuellerZustand;
+            if (!(await existsStateAsync(idZustand))) {
+                await createStateAsync(idZustand, 'unbekannt', { name: 'Wetter: Aktueller Zustand', type: 'string', role: 'text', def: 'unbekannt', read: true, write: false });
+            }
+
+            for (const richtung of this.richtungen) {
+                const solarId = `${this.config.outputIds.basisPfadSolar}_${richtung}`;
+                if (!(await existsStateAsync(solarId))) {
+                    await createStateAsync(solarId, 0, { name: `Wetter: Heizunterstützung Solar ${richtung}`, type: 'number', role: 'value', unit: 'Faktor', def: 0, read: true, write: false });
+                }
+                const windId = `${this.config.outputIds.basisPfadWind}_${richtung}`;
+                if (!(await existsStateAsync(windId))) {
+                    await createStateAsync(windId, 1, { name: `Wetter: Wärmeverlust Wind ${richtung}`, type: 'number', role: 'value', unit: 'Faktor', def: 1, read: true, write: false });
+                }
+            }
+        }
+
+        async initHysterese() {
+            for (const r of this.richtungen) {
+                this.hystereseSolar[r] = new WertMitHysterese(this.config.schwellwerte.hystereseSolar, `${this.config.outputIds.basisPfadSolar}_${r}`);
+                this.hystereseWind[r] = new WertMitHysterese(this.config.schwellwerte.hystereseWind, `${this.config.outputIds.basisPfadWind}_${r}`);
+                
+                await this.hystereseSolar[r].init();
+                await this.hystereseWind[r].init();
+            }
+        }
+
+        // --- Datenbeschaffung ---
+        async getCurrentData() {
+            const data = { solarradiation: null, windspeed: null, winddir: null };
+            
+            for (const key in this.config.weatherIds) {
+                try {
+                    const state = await getStateAsync(this.config.weatherIds[key]);
+                    if (state && state.val !== null && state.val !== undefined && !isNaN(parseFloat(state.val))) {
+                        data[key] = parseFloat(state.val);
+                    } else {
+                        log(`[Wetter-Analyse] Warnung: Ungültiger oder fehlender Wert für ${key}`, 'warn');
+                    }
+                } catch (error) {
+                    log(`[Wetter-Analyse] Fehler beim Lesen von ${key}: ${error.message}`, 'error');
+                }
+            }
+            return data;
+        }
+
+        // --- Logik & Berechnungen ---
+        gradToHimmelsrichtung(deg) {
+            if (deg === null || typeof deg === 'undefined') return 'Nord';
+            
+            // Caching-Logik (auf 5° gerundet zur Erhöhung der Trefferquote)
+            const rounded = Math.round(deg / 5) * 5;
+            if (this.richtungsCache.has(rounded)) return this.richtungsCache.get(rounded);
+
+            let result = 'Nord';
+            if (deg > 315 || deg <= 45) result = 'Nord';
+            else if (deg > 45 && deg <= 135) result = 'Ost';
+            else if (deg > 135 && deg <= 225) result = 'Sued';
+            else if (deg > 225 && deg <= 315) result = 'West';
+            
+            this.richtungsCache.set(rounded, result);
+            return result;
+        }
+
+        getWetterZustand(data) {
+            let zustand = '';
+            
+            if (data.solarradiation > this.config.schwellwerte.grenzeSonnig) zustand = 'Sonnig';
+            else if (data.solarradiation > this.config.schwellwerte.grenzeTeilsBewoelkt) zustand = 'Teils bewölkt';
+            else zustand = 'Bedeckt';
+            
+            const minWind = this.config.schwellwerte.minWindgeschwindigkeit;
+            if (data.windspeed > 40) zustand += ' & stürmisch';
+            else if (data.windspeed > 20) zustand += ' & windig';
+            else if (data.windspeed >= minWind) zustand += ' & mäßiger Wind';
+            else zustand += ' & windstill'; 
+            
+            return zustand;
+        }
+
+        getSunPosition(now) {
+            const nowMs = now.getTime();
+            
+            // Dynamisches Caching: Asymmetrische Dämmerungsgrenzen
+            let isDaemmerung = true; // Fallback für ersten Durchlauf
+            if (this.cachedSunPosition) {
+                const altDeg = this.cachedSunPosition.altitude * 180 / Math.PI;
+                const isMorgen = now.getHours() < 12;
+                const daemmerungsGrenze = isMorgen ? 12 : 18;
+                isDaemmerung = Math.abs(altDeg) < daemmerungsGrenze;
+            }
+            
+            const cacheDauer = isDaemmerung ? 120000 : 300000;
+            
+            if (!this.cachedSunPosition || (nowMs - this.lastSunCalcTime) > cacheDauer) { 
+                this.cachedSunPosition = this.suncalc.getPosition(now, this.config.standort.breitengrad, this.config.standort.laengengrad);
+                this.lastSunCalcTime = nowMs;
+            }
+            return this.cachedSunPosition;
+        }
+
+        glaetteWindFaktoren(neueFaktoren) {
+            const gFaktor = this.config.schwellwerte.windGlaettungsfaktor;
+            for (const r of this.richtungen) {
+                this.faktoren.wind[r] = gFaktor * neueFaktoren[r] + (1 - gFaktor) * this.faktoren.wind[r];
+            }
+            return this.faktoren.wind;
+        }
+
+        glaetteSolarFaktoren(neueFaktoren) {
+            const gFaktor = this.config.schwellwerte.solarGlaettungsfaktor;
+            for (const r of this.richtungen) {
+                this.faktoren.solar[r] = gFaktor * neueFaktoren[r] + (1 - gFaktor) * this.faktoren.solar[r];
+            }
+            return this.faktoren.solar;
+        }
+
+        resetTempObjekte() {
+            for (const r of this.richtungen) {
+                this.tempObjekte.windRoh[r] = 1.0;
+                this.tempObjekte.solarRoh[r] = 0.0;
+            }
+        }
+
+        analyseCurrentData(data) {
+            this.resetTempObjekte();
+
+            // --- Windanalyse ---
+            let waermeverlustWindRoh = this.tempObjekte.windRoh;
+            
+            if (data.windspeed >= this.config.schwellwerte.minWindgeschwindigkeit) {
+                const windRichtung = data.winddir !== null ? this.gradToHimmelsrichtung(data.winddir) : 'Nord';
+                
+                const maxWindFaktor = 1.0 + (0.8 * (1 - this.config.gebaeude.daemmstandard));
+                const zusaetzlicherFaktor = Math.min(maxWindFaktor - 1, (data.windspeed || 0) / this.config.schwellwerte.maxWindgeschwindigkeit);
+                
+                waermeverlustWindRoh[windRichtung] = 1 + zusaetzlicherFaktor;
+
+                for (const r of this.richtungen) {
+                    if (r !== windRichtung) {
+                        waermeverlustWindRoh[r] = 1 + (zusaetzlicherFaktor * this.config.gebaeude.windAbschwaechung);
+                    }
+                }
+            }
+            const waermeverlustWind = this.glaetteWindFaktoren(waermeverlustWindRoh);
+            
+            // --- Solaranalyse ---
+            let heizunterstuetzungSolarRoh = this.tempObjekte.solarRoh;
+            
+            if (this.suncalcAvailable && data.solarradiation >= this.config.schwellwerte.minSolarstrahlung) {
+                const now = new Date();
+                const sunPos = this.getSunPosition(now);
+                const sunAltitudeDeg = sunPos.altitude * 180 / Math.PI;
+                
+                if (sunAltitudeDeg > 0) {
+                    let sunAzimutDeg = (sunPos.azimuth * 180 / Math.PI) + 180;
+                    if (sunAzimutDeg >= 360) sunAzimutDeg -= 360;
+
+                    for (const richtung in this.config.fensterAusrichtung) {
+                        const fenster = this.config.fensterAusrichtung[richtung];
+                        
+                        let isAzimutInRange;
+                        if (fenster.azimutVon > fenster.azimutBis) {
+                            isAzimutInRange = (sunAzimutDeg >= fenster.azimutVon || sunAzimutDeg <= fenster.azimutBis);
+                        } else {
+                            isAzimutInRange = (sunAzimutDeg >= fenster.azimutVon && sunAzimutDeg <= fenster.azimutBis);
+                        }
+
+                        if (sunAltitudeDeg >= fenster.minHoehe && isAzimutInRange) {
+                            const intensitaetsFaktor = Math.max(0, Math.sin(sunPos.altitude)); 
+                            const bewoelkungsFaktor = Math.min(1, Math.max(0, (data.solarradiation || 0) / this.config.schwellwerte.maxSolarstrahlung));
+                            
+                            heizunterstuetzungSolarRoh[richtung] = intensitaetsFaktor * bewoelkungsFaktor;
+                        }
+                    }
+                }
+            }
+            const heizunterstuetzungSolar = this.glaetteSolarFaktoren(heizunterstuetzungSolarRoh);
+
+            return {
+                aktuellerZustand: this.getWetterZustand(data),
+                heizunterstuetzungSolar: heizunterstuetzungSolar,
+                waermeverlustWind: waermeverlustWind,
+            };
+        }
+
+        // --- Hauptablauf ---
+        async run() {
+            try {
+                this.debugLog(`Starte Analyse-Zyklus...`);
+
+                const currentData = await this.getCurrentData();
+                
+                if (currentData.windspeed === null && currentData.solarradiation === null) {
+                    log('[Wetter-Analyse] Keine gültigen Wetterdaten verfügbar. Zyklus übersprungen.', 'warn');
+                    return;
+                }
+
+                const result = this.analyseCurrentData(currentData);
+
+                // Zustand schreiben (einzeln, da anderer Datentyp)
+                await setStateAsync(this.config.outputIds.aktuellerZustand, result.aktuellerZustand, true);
+                
+                // --- Parallele Batch-Updates (I/O Optimierung) ---
+                const solarPromises = this.richtungen.map(r => 
+                    this.hystereseSolar[r].aktualisierenUndSpeichern(result.heizunterstuetzungSolar[r])
+                );
+                const windPromises = this.richtungen.map(r => 
+                    this.hystereseWind[r].aktualisierenUndSpeichern(result.waermeverlustWind[r])
+                );
+
+                const solarUpdates = await Promise.all(solarPromises);
+                const windUpdates = await Promise.all(windPromises);
+
+                // --- Logging ---
+                const solarLogParts = [];
+                const windLogParts = [];
+
+                for (let i = 0; i < this.richtungen.length; i++) {
+                    const r = this.richtungen[i];
+                    if (solarUpdates[i].wert > 0.01) {
+                        solarLogParts.push(`Solar(${r}):${solarUpdates[i].wert}${solarUpdates[i].geaendert ? '*' : ''}`);
+                    }
+                    if (windUpdates[i].wert > 1.01) {
+                        windLogParts.push(`Wind(${r}):${windUpdates[i].wert}${windUpdates[i].geaendert ? '*' : ''}`);
+                    }
+                }
+
+                let logMessage = `Abgeschlossen. Zustand: "${result.aktuellerZustand}".`;
+                if (solarLogParts.length > 0) logMessage += ` ${solarLogParts.join(' ')}`;
+                if (windLogParts.length > 0) logMessage += ` ${windLogParts.join(' ')}`;
+                
+                this.debugLog(logMessage);
+                
+            } catch (error) {
+                log(`[Wetter-Analyse] KRITISCHER FEHLER: ${error.message}`, 'error');
+                if (error.stack) log(error.stack, 'error');
+                await setStateAsync(this.config.outputIds.aktuellerZustand, 'Fehler bei der Analyse', true);
+            }
+        }
     }
 
-    const currentData = await getCurrentData();
-    const result = analyseCurrentData(currentData);
-
-    await setStateAsync(CONFIG.outputIds.aktuellerZustand, result.aktuellerZustand, true);
-    
-    const solarLogParts = [];
-    for (const richtung in result.heizunterstuetzungSolar) {
-        const id = `${CONFIG.outputIds.basisPfadSolar}_${richtung}`;
-        const val = parseFloat(result.heizunterstuetzungSolar[richtung].toFixed(3));
-        await setStateAsync(id, val, true);
-        if (val > 0) solarLogParts.push(`Solar(${richtung}):${val}`);
-    }
-
-    const windLogParts = [];
-    for (const richtung in result.waermeverlustWind) {
-        const id = `${CONFIG.outputIds.basisPfadWind}_${richtung}`;
-        const val = parseFloat(result.waermeverlustWind[richtung].toFixed(3));
-        await setStateAsync(id, val, true);
-        if (val > 1) windLogParts.push(`Wind(${richtung}):${val.toFixed(2)}`);
-    }
-
-    if (CONFIG.debugLogAktiv) {
-        let logMessage = `[Wetter-Analyse] Abgeschlossen. Zustand: "${result.aktuellerZustand}".`;
-        if (solarLogParts.length > 0) logMessage += ` ${solarLogParts.join(' ')}`;
-        if (windLogParts.length > 0) logMessage += ` ${windLogParts.join(' ')}`;
-        log(logMessage);
-    }
-}
-
-// -------------------------------------------------------------------------------------
-// 6. SKRIPT-START & TRIGGER
-// -------------------------------------------------------------------------------------
-(async () => {
-    await createStates();
-    
-    // Empfohlenes Intervall: 5-15 Minuten
-    schedule('*/15 * * * *', runAnalysis);
-    
-    // Einmaliger Start nach kurzer Verzögerung
-    setTimeout(runAnalysis, 5000);
-})();
+    // -------------------------------------------------------------------------------------
+    // 4. SKRIPT-START
+    // -------------------------------------------------------------------------------------
+    const wetterAnalyse = new WetterAnalyse(CONFIG);
+    wetterAnalyse.init();
 
 })(); // Ende der Kapselung
-
