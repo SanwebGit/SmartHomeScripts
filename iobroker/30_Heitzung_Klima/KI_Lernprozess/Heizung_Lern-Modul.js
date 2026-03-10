@@ -1,6 +1,6 @@
 /**
  * @fileoverview Selbstlernende Heizungs-Optimierung (Raum-Verhaltens-Analyse)
- * @version 2.1 (Finalisiert)
+ * @version 2.2 (Finalisiert & Robust)
  * @author Sanweb
  * @license MIT
  *
@@ -17,17 +17,13 @@
  * faktoren) mit der Aktion (Soll-Temperatur) und dem Ergebnis (Ist-Temperatur
  * und Ventilöffnung).
  *
- * 2. BEWERTEN: Es erkennt Muster wie "Überschwingen" (Raum wird zu warm, oft
- * durch unterschätzte Sonneneinstrahlung) oder "Trägheit" (Raum wird nicht
- * warm genug, oft durch unterschätzten Wärmeverlust).
+ * 2. BEWERTEN: Es sammelt die durchschnittlichen Temperaturabweichungen
+ * bei signifikantem Wetter-Einfluss (Solar oder Wind).
  *
  * 3. ANPASSEN: Basierend auf den erkannten Mustern passt das Skript langsam und
  * iterativ raumspezifische Korrektur-Faktoren an (z.B. "Solar_Korrektur" für
  * das Wohnzimmer). Diese Faktoren werden von den Einzelraum-Regelungsskripten
  * genutzt, um deren Vorhersagegenauigkeit kontinuierlich zu verbessern.
- *
- * NEU in V2.1: Lernt nun unabhängig von der globalen Heizperiode, um auch
- * wertvolle Daten aus den Übergangszeiten (Frühling/Herbst) zu erfassen.
  */
 
 (function(){ // Start der Kapselung, um globale Variablen zu vermeiden
@@ -44,11 +40,12 @@ const CONFIG = {
     // --- B. LERN-PARAMETER ---
     analyseZeitraumStunden: 24,   // Zeitraum für die historische Analyse
     lernrate: 0.01,               // Wie stark die Korrekturfaktoren pro Zyklus angepasst werden (z.B. 0.01 = 1%)
+    konvergenzRate: 0.001,        // Sehr langsame Rückführung zur Mitte (1.0), wenn keine Events vorliegen (10x langsamer als lernen)
     minAbweichungFuerLernen: 0.3, // Mindestabweichung (Ist vs. Soll in °C), damit ein Ereignis als Lern-Input gilt
     
-    // Schwellenwerte für Mustererkennung
-    ueberschwingenSchwelle: 0.5,  // °C über Soll, gilt als Überschwingen
-    traegheitSchwelle: -0.5,      // °C unter Soll, gilt als Trägheit
+    // Schwellenwerte für Wetter-Einfluss (Wann ist ein Faktor dominant?)
+    minSolarEinfluss: 0.2,        // Ab diesem Wert wird die Sonneneinstrahlung als signifikant gewertet
+    minWindEinfluss: 1.1,         // Ab diesem Wert wird der Wind als signifikant gewertet
 
     // --- C. RÄUME & DATENPUNKTE ---
     // Definieren Sie hier alle Räume, die das Skript lernen und optimieren soll.
@@ -81,6 +78,8 @@ const CONFIG = {
     ],
 
     // Pfade zu den Wetter-Faktoren (Output vom Wetter-Analyse-Skript)
+    // WICHTIG: Das Wetter-Analyse-Skript MUSS die Himmelsrichtung exakt als Suffix anhängen
+    // (z.B. "_Sued", "_West"), passend zur Konfiguration unter "wetterAusrichtung"!
     wetterDatenPfade: {
         basisPfadSolar: '0_userdata.0.Heizung.Analyse.Wetter_Heizunterstuetzung_Solar',
         basisPfadWind: '0_userdata.0.Heizung.Analyse.Wetter_Waermeverlust_Wind',
@@ -118,6 +117,16 @@ async function initialisiereDatenpunkte() {
             });
         }
     }
+
+    // Zeitstempel für den letzten erfolgreichen Lauf
+    const letzterLaufId = `${CONFIG.lernwerteBasisPfad}.Letzter_Lauf`;
+    if (!(await existsStateAsync(letzterLaufId))) {
+        await createStateAsync(letzterLaufId, 0, {
+            name: `Zeitstempel des letzten Lern-Zyklus`,
+            type: 'number', role: 'date', read: true, write: false,
+            def: 0
+        });
+    }
 }
 
 // -------------------------------------------------------------------------------------
@@ -126,6 +135,7 @@ async function initialisiereDatenpunkte() {
 
 /**
  * Holt alle relevanten Zeitreihen für einen Raum aus der InfluxDB.
+ * Robust gegenüber einzelnen fehlerhaften Datenpunkten dank allSettled.
  * @param {object} raum - Das Raum-Konfigurationsobjekt.
  * @returns {Promise<object|null>} Ein Objekt mit den Datenreihen oder null bei Fehler.
  */
@@ -149,19 +159,32 @@ async function getHistorischeDaten(raum) {
         sendToAsync(CONFIG.influxdbInstance, 'getHistory', {
             id: id,
             options: { start, end, aggregate: 'mean', step: 600000 } // 10-Minuten-Intervalle
-        }).then(result => {
-            if (result.error) throw new Error(`Fehler bei ${id}: ${result.error}`);
+        }).then(rawResult => {
+            // JSDoc Typ-Zuweisung, um die strenge Prüfung des ioBroker-Editors zu umgehen
+            const result = /** @type {any} */ (rawResult);
+            if (result.error) throw new Error(`Fehler bei DB-Abfrage: ${result.error}`);
             return { name, data: result.result || [] };
         })
     );
 
     try {
-        const ergebnisse = await Promise.all(anfragen);
+        // Nutzen von allSettled, damit das Skript nicht stoppt, wenn ein einzelner Sensor ausfällt
+        const ergebnisse = await Promise.allSettled(anfragen);
         const datenContainer = {};
-        ergebnisse.forEach(e => datenContainer[e.name] = e.data);
+        
+        ergebnisse.forEach((e, index) => {
+            if (e.status === 'fulfilled') {
+                datenContainer[e.value.name] = e.value.data;
+            } else {
+                const idName = Object.keys(datenpunkte)[index];
+                log(`[Lern-Skript] Warnung: Historie für '${idName}' nicht verfügbar. Grund: ${e.reason}`, 'warn');
+                datenContainer[idName] = []; // Leeres Array als Fallback, verhindert Crashes
+            }
+        });
+        
         return datenContainer;
     } catch (e) {
-        log(`[Lern-Skript] Fehler beim Abrufen der Verlaufsdaten für ${raum.name}: ${e.message}`, 'error');
+        log(`[Lern-Skript] Schwerer Fehler beim Abrufen der Verlaufsdaten für ${raum.name}: ${e.message}`, 'error');
         return null;
     }
 }
@@ -183,8 +206,10 @@ async function analysiereRaum(raum) {
         return;
     }
 
-    let ueberschwingenEvents = 0;
-    let traegheitEvents = 0;
+    let sumAbweichungSolar = 0;
+    let countSolarEvents = 0;
+    let sumAbweichungWind = 0;
+    let countWindEvents = 0;
 
     // Phase 1 & 2: Beobachten und Bewerten
     for (let i = 0; i < historien.ist.length; i++) {
@@ -193,7 +218,6 @@ async function analysiereRaum(raum) {
         const ventil = historien.ventil.find(p => p.ts === historien.ist[i].ts)?.val;
         
         // **Intelligenter Filter:** Nur Datenpunkte analysieren, bei denen aktiv geheizt werden sollte.
-        // Dies macht die globale Heizperiode-Prüfung überflüssig.
         if (soll === null || ventil === null || soll < 12) continue;
 
         const abweichung = ist - soll;
@@ -201,24 +225,28 @@ async function analysiereRaum(raum) {
         if (Math.abs(abweichung) < CONFIG.minAbweichungFuerLernen) continue;
 
         // Finde dominante Wetterursache für diesen Zeitpunkt
-        let maxSolar = 0, maxWind = 1;
+        let maxSolar = 0, maxWind = 0;
         raum.wetterAusrichtung.forEach(richtung => {
             const solarVal = historien[`solar_${richtung}`]?.find(p => p.ts === historien.ist[i].ts)?.val;
-            if (solarVal > maxSolar) maxSolar = solarVal;
+            if (solarVal !== undefined && solarVal > maxSolar) maxSolar = solarVal;
+            
             const windVal = historien[`wind_${richtung}`]?.find(p => p.ts === historien.ist[i].ts)?.val;
-            if (windVal > maxWind) maxWind = windVal;
+            if (windVal !== undefined && windVal > maxWind) maxWind = windVal;
         });
 
-        // Mustererkennung
-        if (abweichung > CONFIG.ueberschwingenSchwelle && ventil < 0.1 && maxSolar > 0.2) {
-            ueberschwingenEvents++;
-        } else if (abweichung < CONFIG.traegheitSchwelle && ventil > 0.8 && maxWind > 1.1) {
-            traegheitEvents++;
+        // Mustererkennung & Abweichungen sammeln
+        if (maxSolar > CONFIG.minSolarEinfluss) {
+            sumAbweichungSolar += abweichung;
+            countSolarEvents++;
+        }
+        if (maxWind > CONFIG.minWindEinfluss) {
+            sumAbweichungWind += abweichung;
+            countWindEvents++;
         }
     }
 
     if (CONFIG.debugLogAktiv) {
-        log(`[Lern-Skript] ${raum.name} - Analyse-Ergebnis: Überschwingen-Events: ${ueberschwingenEvents}, Trägheit-Events: ${traegheitEvents}`);
+        log(`[Lern-Skript] ${raum.name} - Analyse-Ergebnis: Solar-Events: ${countSolarEvents}, Wind-Events: ${countWindEvents}`);
     }
 
     // Phase 3: Anpassen
@@ -228,24 +256,38 @@ async function analysiereRaum(raum) {
     let currentSolar = (await getStateAsync(solarId)).val;
     let currentWind = (await getStateAsync(windId)).val;
 
-    if (ueberschwingenEvents > traegheitEvents) {
-        currentSolar -= CONFIG.lernrate; // Wenn zu warm, solaren Einfluss reduzieren
-        log(`[Lern-Skript] ${raum.name} - LERNEN: System hat überreagiert. Reduziere Solar-Korrektur auf ${currentSolar.toFixed(3)}.`);
-    } else if (traegheitEvents > ueberschwingenEvents) {
-        currentWind += CONFIG.lernrate; // Wenn zu kalt, Einfluss von Wärmeverlust erhöhen
-        log(`[Lern-Skript] ${raum.name} - LERNEN: System war zu träge. Erhöhe Wind-Korrektur auf ${currentWind.toFixed(3)}.`);
+    // --- Anpassung basierend auf tatsächlichen Durchschnittsabweichungen ---
+    if (countSolarEvents > 0) {
+        const durchschnittsAbweichungSolar = sumAbweichungSolar / countSolarEvents;
+        // Positive Abweichung (zu warm) -> Solarfaktor reduzieren. Negative Abweichung (zu kalt) -> Solarfaktor erhöhen.
+        currentSolar -= durchschnittsAbweichungSolar * CONFIG.lernrate;
+        if (CONFIG.debugLogAktiv) log(`[Lern-Skript] ${raum.name} - LERNEN (Solar): Durchschnittsabweichung=${durchschnittsAbweichungSolar.toFixed(2)}. Passe Faktor auf ${currentSolar.toFixed(3)} an.`);
     } else {
-        // Wenn System stabil, langsam zur Mitte (1.0) konvergieren
-        currentSolar = currentSolar * (1 - CONFIG.lernrate) + 1.0 * CONFIG.lernrate;
-        currentWind = currentWind * (1 - CONFIG.lernrate) + 1.0 * CONFIG.lernrate;
+        // Sehr langsame Konvergenz zum Mittelwert, wenn es keine Events gab
+        currentSolar = currentSolar * (1 - CONFIG.konvergenzRate) + 1.0 * CONFIG.konvergenzRate;
+    }
+
+    if (countWindEvents > 0) {
+        const durchschnittsAbweichungWind = sumAbweichungWind / countWindEvents;
+        // Negative Abweichung (zu kalt) -> Windfaktor erhöhen. (- mal - = +). 
+        // Positive Abweichung -> Windfaktor leicht reduzieren.
+        currentWind -= durchschnittsAbweichungWind * CONFIG.lernrate;
+        if (CONFIG.debugLogAktiv) log(`[Lern-Skript] ${raum.name} - LERNEN (Wind): Durchschnittsabweichung=${durchschnittsAbweichungWind.toFixed(2)}. Passe Faktor auf ${currentWind.toFixed(3)} an.`);
+    } else {
+        // Sehr langsame Konvergenz zum Mittelwert, wenn es keine Events gab
+        currentWind = currentWind * (1 - CONFIG.konvergenzRate) + 1.0 * CONFIG.konvergenzRate;
     }
 
     // Sicherstellen, dass Werte in den definierten Grenzen bleiben
     currentSolar = Math.max(0.5, Math.min(1.5, currentSolar));
     currentWind = Math.max(0.5, Math.min(1.5, currentWind));
 
-    await setStateAsync(solarId, parseFloat(currentSolar.toFixed(4)), true);
-    await setStateAsync(windId, parseFloat(currentWind.toFixed(4)), true);
+    try {
+        await setStateAsync(solarId, parseFloat(currentSolar.toFixed(4)), true);
+        await setStateAsync(windId, parseFloat(currentWind.toFixed(4)), true);
+    } catch (e) {
+        log(`[Lern-Skript] Fehler beim Schreiben der Lernwerte für ${raum.name}: ${e.message}`, 'error');
+    }
 }
 
 
@@ -253,10 +295,14 @@ async function analysiereRaum(raum) {
 // 5. HAUPTFUNKTION & STEUERUNG
 // -------------------------------------------------------------------------------------
 async function main() {
-    log(`[Lern-Skript] Starte neuen Lern-Zyklus (V${"2.1"}) für alle Räume...`);
+    log(`[Lern-Skript] Starte neuen Lern-Zyklus (V${"2.2"}) für alle Räume...`);
     for (const raum of CONFIG.raeume) {
         await analysiereRaum(raum);
     }
+    
+    // Zeitstempel für den erfolgreichen Durchlauf setzen
+    await setStateAsync(`${CONFIG.lernwerteBasisPfad}.Letzter_Lauf`, new Date().getTime(), true);
+    
     log("[Lern-Skript] Lern-Zyklus für alle Räume abgeschlossen.");
 }
 
@@ -274,4 +320,3 @@ async function main() {
 })();
 
 })(); // Ende der Kapselung
-
