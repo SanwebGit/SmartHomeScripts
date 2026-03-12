@@ -4,7 +4,7 @@
  * ==============================================================================
  * Autor:         Sanweb
  * Version:       5.4
- * Letzte Änderung: 2024-05-22
+ * Letzte Änderung: 2025-05-22
  * Zweck:         Automatisierte Bestimmung der Heizperiode basierend auf der 
  * Tagesmitteltemperatur und kalendarischen Zeiträumen.
  * Korrektur:     getStatesAsync durch Promise.all([getStateAsync...]) ersetzt.
