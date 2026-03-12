@@ -1,13 +1,13 @@
 /**
  * =============================================================================
- * @file        stromzaehler.js
+ * @file         stromzaehler.js
  * @description Skript zur Erfassung, Berechnung und Historisierung von 
  * Stromverbrauchsdaten (Tages-, Wochen-, Monats- und Jahreswerte).
  * Liest Daten eines Zigbee-Sensors, erkennt Sensor-Resets und 
  * gleicht diese über einen dynamischen Offset automatisch ab.
- * @version     1.7.1 (Initial Run Zigbee-Offset Kompensation)
- * @date        2026-03-04
- * @author      Sanweb
+ * @version      1.7.1 (Initial Run Zigbee-Offset Kompensation)
+ * @date         2026-03-04
+ * @author       Sanweb
  * =============================================================================
  */
 
@@ -427,13 +427,14 @@ class StromZaehlerManager {
         const currentStateVal = await this.getStateCached(fullId);
         
         if (currentStateVal !== wert) {
+            // Cache direkt vor dem Schreiben aktualisieren, damit parallele Aufrufe blockierungsfrei den neuen Wert kennen
+            this.stateCache.set(fullId, { value: wert, timestamp: Date.now() });
+
             if (typeof setStateAsync === 'function') {
                 await setStateAsync(fullId, wert, ack);
             } else {
                 setState(fullId, wert, ack); // Fallback für ältere ioBroker Installationen
             }
-            // Cache direkt nach dem Schreiben aktualisieren (Cache-Invalidation)
-            this.stateCache.set(fullId, { value: wert, timestamp: Date.now() });
         }
     }
 
@@ -516,8 +517,8 @@ class StromZaehlerManager {
             
             // Performance-Monitoring
             const duration = Date.now() - startTime;
-            if (duration > 100) {
-                log(`WARN: Verarbeitung des Zählerstands dauerte ${duration}ms. Das Event-Loop wird stark belastet.`, "warn");
+            if (duration > 500) {
+                log(`WARN: Verarbeitung des Zählerstands dauerte ${duration}ms. Das Event-Loop wird evtl. stark belastet.`, "warn");
             }
         }
     }
