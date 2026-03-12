@@ -3,7 +3,7 @@
 Anwesenheitsskript für ioBroker
 ================================================================================
  * Author:         Sanweb
- * Version:        3.0.1 (Masterpiece - Syntax Fix)
+ * Version:        3.0.1
  * Erstellt am:    04.03.2026
  *
  * Beschreibung:
