@@ -1,9 +1,9 @@
 /**
- * Haushaltsgeräte-Überwachung PRO (v4.1.0 - Next Level)
+ * Haushaltsgeräte-Überwachung PRO (v4.2.0 - Auto-Influx)
  * - Prädiktive Zeitvorhersage (InfluxDB Durchschnitt)
  * - Intelligentes Benachrichtigungs-Management (Quiet Hours & Reminder)
  * - Anomalie-Erkennung (Sicherheits-Abschaltung/Alarm)
- * - Auto-State Creation & InfluxDB 2.x Support
+ * - Auto-State Creation & AUTO-INFLUX CONFIGURATION
  */
 
 (async function() {
@@ -72,7 +72,39 @@
         }
     ];
 
-    // --- 3. AKTIONEN (Smart Notifications) ---
+    // --- 3. HILFSFUNKTIONEN ---
+    
+    // Automatische InfluxDB Aktivierung
+    async function enableInfluxLogging(id) {
+        try {
+            const obj = await getObjectAsync(id);
+            if (obj && obj.common) {
+                const custom = obj.common.custom || {};
+                if (!custom[INFLUXDB_INSTANCE] || !custom[INFLUXDB_INSTANCE].enabled) {
+                    log(`${id}: Aktiviere InfluxDB-Logging automatisch.`);
+                    await extendObjectAsync(id, {
+                        common: {
+                            custom: {
+                                [INFLUXDB_INSTANCE]: {
+                                    enabled: true,
+                                    changesOnly: true,
+                                    debounce: 0,
+                                    retention: 0,
+                                    changesRelativ: 0,
+                                    changesMinDelta: 0,
+                                    storageType: "",
+                                    aliasId: ""
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+        } catch (e) {
+            log(`Fehler beim Aktivieren von InfluxDB für ${id}: ${e}`, 'warn');
+        }
+    }
+
     function isQuietTime() {
         const now = new Date();
         const currentTime = now.getHours() * 60 + now.getMinutes();
@@ -89,8 +121,6 @@
             log("Nachtruhe aktiv: Benachrichtigung nur im Log.");
             return;
         }
-        // Beispiel für Telegram Integration:
-        // sendTo('telegram.0', { text: `*${title}*\n${message}`, parse_mode: 'Markdown' });
     }
 
     // --- 4. SKRIPT-LOGIK ---
@@ -107,11 +137,9 @@
             CURRENT_ENERGY: `${SCRIPT_DP_PATH}.Aktueller_Verbrauch_kWh`,
             RUN_START_TIME: `${SCRIPT_DP_PATH}.Aktueller_Startzeitpunkt`,
             RUN_START_ENERGY: `${SCRIPT_DP_PATH}.Aktueller_Energie_Startwert`,
-            // Next Level DPs
             PREDICTED_END: `${SCRIPT_DP_PATH}.Voraussichtliches_Ende`,
             REMAINING_TIME: `${SCRIPT_DP_PATH}.Restlaufzeit_Minuten`,
             ANOMALY_ALARM: `${SCRIPT_DP_PATH}.Anomalie_Alarm`,
-            // Analyse
             ANALYSE_START: `${SCRIPT_DP_PATH}.Analyse.Starten`,
             ANALYSE_STATUS: `${SCRIPT_DP_PATH}.Analyse.Status`,
             VORSCHLAG_START: `${SCRIPT_DP_PATH}.Analyse.Vorschlag_startingThreshold`,
@@ -139,13 +167,17 @@
             await createStateAsync(DP.VORSCHLAG_FINISH, 0, { type: 'number', unit: 'W' });
         })();
 
-        // Durchschnittliche Laufzeit aus InfluxDB ermitteln
+        // Automatisches Logging für Quellen und notwendige Statistik-DPs aktivieren
+        await enableInfluxLogging(config.powerSensorId);
+        await enableInfluxLogging(config.energySensorId);
+        await enableInfluxLogging(DP.LAST_RUN_DURATION);
+
         async function getAverageDuration() {
             return new Promise((resolve) => {
                 const end = Date.now();
                 const start = end - (30 * 24 * 60 * 60 * 1000);
                 getHistory(INFLUXDB_INSTANCE, { id: DP.LAST_RUN_DURATION, start: start, end: end, aggregate: 'none' }, (err, result) => {
-                    if (err || !result || result.length === 0) resolve(120); // Fallback 2h
+                    if (err || !result || result.length === 0) resolve(120); 
                     const avg = result.reduce((a, b) => a + b.val, 0) / result.length;
                     resolve(Math.round(avg));
                 });
@@ -154,6 +186,7 @@
 
         function updatePrediction(avgDuration) {
             const startTime = getState(DP.RUN_START_TIME).val;
+            if (!startTime) return;
             const elapsed = (Date.now() - startTime) / 60000;
             const remaining = Math.max(0, Math.round(avgDuration - elapsed));
             const end = new Date(Date.now() + remaining * 60000);
@@ -177,12 +210,10 @@
                 setState(DP.RUN_START_ENERGY, energyNow, true);
                 setState(DP.ANOMALY_ALARM, false, true);
                 
-                // Vorhersage starten
                 const avg = await getAverageDuration();
                 updatePrediction(avg);
                 predictionInterval = setInterval(() => updatePrediction(avg), 60000);
 
-                // Sicherheits-Timer
                 safetyTimer = setTimeout(() => {
                     setState(DP.ANOMALY_ALARM, true, true);
                     sendSmartNotification("ALARM", `${config.deviceName} läuft ungewöhnlich lange (> ${SAFETY_TIMEOUT_MIN} Min)! Bitte prüfen.`, 2);
@@ -208,7 +239,6 @@
 
                 sendSmartNotification(config.deviceName, `${config.deviceName} ist fertig! Dauer: ${durationMin.toFixed(0)} Min, Verbrauch: ${energyKWh.toFixed(2)} kWh.`, 1);
                 
-                // Reminder-Timer starten
                 reminderTimer = setInterval(() => {
                     sendSmartNotification(config.deviceName, "Erinnerung: Die Wäsche liegt noch im Gerät.", 1);
                 }, REMINDER_INTERVAL_MIN * 60000);
@@ -219,14 +249,12 @@
             const power = obj.state.val;
             const state = getState(DP.STATUS).val;
 
-            // Aktuellen Verbrauch während des Laufs berechnen
             if (state !== STATES.IDLE && state !== STATES.STARTING) {
                 const startE = getState(DP.RUN_START_ENERGY).val;
                 const currE = getState(config.energySensorId).val || 0;
                 setState(DP.CURRENT_ENERGY, parseFloat((currE - startE).toFixed(3)), true);
             }
             
-            // Türöffnung / Entleerung erkennen (Power > 0.5W aber Status IDLE -> Reminder stoppen)
             if (power > 0.5 && state === STATES.IDLE && reminderTimer) {
                 clearInterval(reminderTimer);
                 reminderTimer = null;
@@ -250,7 +278,6 @@
             if (ns === STATES.PAUSED) pauseTimeout = setTimeout(() => setApplianceState(STATES.IDLE), runtimeConfig.pauseHysteresisMin * 60000);
         });
 
-        // Analyse bleibt wie im Original-Script (Histogramm-Methode)
         on({id: DP.ANALYSE_START, val: true}, () => {
             log(`Analyse für ${config.deviceName} gestartet...`);
             const end = Date.now();
