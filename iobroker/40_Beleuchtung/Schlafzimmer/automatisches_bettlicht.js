@@ -2,7 +2,7 @@
  * ==============================================================================
  * ioBroker Script: Automatische Bettbeleuchtung
  * ==============================================================================
- * @version   1.1.0
+ * @version   1.1.3
  * @author    Sanweb
  * @license   MIT License
  * @description
@@ -32,12 +32,14 @@
   // ============================================
   const DP = {
     links: {
-      ledCmd:   'mqtt.1.zigbee2mqtt.Bettlicht_Rosie.set',     // MQTT Set-Datenpunkt für links
+      ledCmd:   'mqtt.1.zigbee2mqtt.Bettlicht Rosie.set',     // ioBroker ID (ohne Unterstrich)
+      ledTopic: 'zigbee2mqtt/Bettlicht Rosie/set',            // Echtes MQTT Topic
       motion:   'zigbee2mqtt.0.0xa4c1387d7ee56494.presence',  // Zigbee Bewegungsmelder
       matte:    'hm-rpc.0.001E1D899E94B0.1.STATE'             // Homematic Kontaktmatte
     },
     rechts: {
-      ledCmd:   'mqtt.1.zigbee2mqtt.Bettlicht_Alex.set',      // MQTT Set-Datenpunkt für rechts
+      ledCmd:   'mqtt.1.zigbee2mqtt.Bettlicht Alex.set',      // ioBroker ID (ohne Unterstrich)
+      ledTopic: 'zigbee2mqtt/Bettlicht Alex/set',             // Echtes MQTT Topic
       motion:   'zigbee2mqtt.0.0xa4c138f5aeea45b6.presence',  // Zigbee Bewegungsmelder
       matte:    'hm-rpc.0.001E1D899E922D.1.STATE'             // Homematic Kontaktmatte
     },
@@ -75,11 +77,6 @@
   // Hilfsfunktionen: Logging & Timer Cleanup
   // ============================================
   
-  /**
-   * Loggt eine Nachricht mit dem konfigurierten Präfix
-   * @param {string} msg - Die Log-Nachricht
-   * @param {'info' | 'warn' | 'error' | 'debug' | 'silly'} [level='info'] - Das ioBroker Log-Level
-   */
   function scriptLog(msg, level = 'info') {
     log(CONFIG.logPrefix + msg, level);
   }
@@ -106,30 +103,36 @@
   // ============================================
   scriptLog('Führe Systemprüfung der Datenpunkte durch...', 'info');
   
-  // MQTT Datenpunkte prüfen und ggf. automatisch anlegen
-  const mqttDPs = [DP.links.ledCmd, DP.rechts.ledCmd];
-  for (const id of mqttDPs) {
-    if (!existsState(id)) {
-      scriptLog(`MQTT Datenpunkt ${id} fehlt. Versuche Erstellung in fremdem Namensraum...`, 'warn');
+  // MQTT Datenpunkte prüfen und ggf. automatisch mit exaktem Topic anlegen
+  const mqttTargets = [
+    { id: DP.links.ledCmd, topic: DP.links.ledTopic },
+    { id: DP.rechts.ledCmd, topic: DP.rechts.ledTopic }
+  ];
+
+  for (const target of mqttTargets) {
+    if (!existsState(target.id)) {
+      scriptLog(`MQTT Datenpunkt ${target.id} fehlt. Wird mit Ziel-Topic "${target.topic}" angelegt...`, 'warn');
       
-      setObject(id, {
+      setObject(target.id, {
         type: 'state',
         common: {
-          name: id.split('.').pop(),
+          name: 'set',
           type: 'string',
           role: 'state',
           read: true,
           write: true,
           desc: 'Automatisch angelegt durch Bettlicht-Skript'
         },
-        native: {}
+        native: {
+          topic: target.topic // <--- HIER IST DIE MAGIE: Das exakte MQTT Topic für den Adapter!
+        }
       }, function(err) {
         if (err) {
-          scriptLog(`FEHLER beim Anlegen von ${id}: ${err} -> Bitte in den JavaScript-Instanz-Einstellungen "Erlaube das Kommando setObj" aktivieren!`, 'error');
+          scriptLog(`FEHLER beim Anlegen von ${target.id}: ${err}`, 'error');
         } else {
-          scriptLog(`Erfolgreich angelegt: ${id}`, 'info');
+          scriptLog(`Erfolgreich angelegt: ${target.id}`, 'info');
           // Startwert setzen
-          setState(id, JSON.stringify({ state: "OFF" }), true);
+          setState(target.id, JSON.stringify({ state: "OFF" }), true);
         }
       });
     }
@@ -176,7 +179,6 @@
     const ledCmdId = DP[side].ledCmd;
     const payloadString = JSON.stringify({ state: state ? "ON" : "OFF" });
 
-    // Letzter gesendeter Befehl (da .set kein echter Status-DP ist, enthält er nur den letzten String)
     const rawCurrent = existsState(ledCmdId) ? getState(ledCmdId)?.val : null;
 
     if (!CONFIG.forceSend && rawCurrent === payloadString) {
@@ -184,8 +186,6 @@
       return;
     }
 
-    // WICHTIG: Das 'false' als 3. Parameter ist das ack-Flag. 
-    // false = Befehl an Hardware senden (Command)
     setState(ledCmdId, payloadString, false);
     scriptLog(`Licht ${side}: ${state ? 'AN' : 'AUS'} (MQTT Payload: ${payloadString})`, 'info');
   }
@@ -205,7 +205,6 @@
       return;
     }
 
-    // Logik: Matte = leer UND Motion = true
     if (isMatteEmpty && isMotion) {
       setLight(side, true);
 
@@ -228,7 +227,6 @@
   // ============================================
   ['links', 'rechts'].forEach(side => {
     
-    // Trigger: Bewegung
     on({ id: DP[side].motion, change: 'any' }, function(obj) {
       const motionVal = parseBool(obj.state?.val);
       const isOccupied = getMatteOccupiedState(getState(DP[side].matte)?.val);
@@ -238,7 +236,6 @@
       processSide(side, motionVal, isOccupied, nachtVal);
     });
 
-    // Trigger: Kontaktmatte
     on({ id: DP[side].matte, change: 'any' }, function(obj) {
       const isOccupied = getMatteOccupiedState(obj.state?.val);
       const motionVal = parseBool(getState(DP[side].motion)?.val);
