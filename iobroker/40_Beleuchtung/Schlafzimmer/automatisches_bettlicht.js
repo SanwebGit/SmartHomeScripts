@@ -2,7 +2,7 @@
  * ==============================================================================
  * ioBroker Script: Automatische Bettbeleuchtung
  * ==============================================================================
- * @version   1.0.2
+ * @version   1.0.7
  * @author    Sanweb
  * @license   MIT License
  * @description
@@ -20,9 +20,12 @@
   const CONFIG = {
     timerMs: 2 * 60 * 1000,   // 2 Minuten Timer-Dauer
     defaultNachtWert: 'Tag',  // Fallback-Wert für Tag/Nacht
-    nachtWert: 'Nacht',       // Expliziter Vergleichswert für Nacht
-    enableDebug: true,        // Debug-Logging steuern (auf false setzen für produktiven, leisen Betrieb)
-    logPrefix: '[Bettlicht] ' // Präfix für alle Log-Ausgaben zur besseren Übersicht
+    nachtWert: 'Nacht',       // Expliziter Vergleichswert für Nacht. ACHTUNG: Groß/Kleinschreibung beachten!
+    enableDebug: true,        // Diagnose-Logging steuern
+    forceSend: true,          // HACK/FIX: Auf true setzen, um die Zigbee-Schonung zu ignorieren
+    invertMatte: true,        // Auf true setzen, falls die Matte 1/true sendet, wenn sie LEER ist
+    sendAsString: false,      // NEU: Setze auf true, falls Zigbee2MQTT zwingend "ON"/"OFF" als Text statt true/false verlangt
+    logPrefix: '[Bettlicht] ' // Präfix für alle Log-Ausgaben
   };
 
   // ============================================
@@ -30,14 +33,14 @@
   // ============================================
   const DP = {
     links: {
-      led:      'zigbee2mqtt.0.0xa4c13852a863096b.state',     // Zigbee LED-Lichtschalter
+      led:      'zigbee2mqtt.0.0xa4c13852a863096b.state',     // Zigbee LED (ID endet auf .state, Rolle ist switch)
       motion:   'zigbee2mqtt.0.0xa4c1387d7ee56494.presence',  // Zigbee Bewegungsmelder
-      matte:    'hm-rpc.0.001E1D899E94B0.1.STATE'             // Homematic Kontaktmatte (Bett belegt)
+      matte:    'hm-rpc.0.001E1D899E94B0.1.STATE'             // Homematic Kontaktmatte
     },
     rechts: {
-      led:      'zigbee2mqtt.0.0xa4c138da7c22e582.state',     // Zigbee LED-Lichtschalter
+      led:      'zigbee2mqtt.0.0xa4c138da7c22e582.state',     // Zigbee LED (ID endet auf .state, Rolle ist switch)
       motion:   'zigbee2mqtt.0.0xa4c138f5aeea45b6.presence',  // Zigbee Bewegungsmelder
-      matte:    'hm-rpc.0.001E1D899E922D.1.STATE'             // Homematic Kontaktmatte (Bett belegt)
+      matte:    'hm-rpc.0.001E1D899E922D.1.STATE'             // Homematic Kontaktmatte
     },
     nacht:    '0_userdata.0.System.Astro.TagNacht'            // Globale Astro-Variable (Tag/Nacht)
   };
@@ -52,11 +55,6 @@
   // Hilfsfunktionen: Datentypen normieren
   // ============================================
   
-  /**
-   * Universal-Übersetzer für ioBroker-Datentypen.
-   * Macht aus 1, "1", "true", true immer ein echtes true.
-   * Macht aus 0, "0", "false", false immer ein echtes false.
-   */
   function parseBool(val) {
     if (val === null || val === undefined) return false;
     
@@ -73,6 +71,15 @@
     return Boolean(val);
   }
 
+  // Wandelt den rohen Mattenwert in einen logischen "Belegt"-Zustand um
+  function getMatteOccupiedState(rawVal) {
+    let isOccupied = parseBool(rawVal);
+    if (CONFIG.invertMatte) {
+      isOccupied = !isOccupied; // Dreht die Logik um, falls invertMatte true ist
+    }
+    return isOccupied;
+  }
+
   // ============================================
   // Hilfsfunktionen: Logging & Timer Cleanup
   // ============================================
@@ -87,7 +94,8 @@
   }
 
   function debugLog(msg) {
-    if (CONFIG.enableDebug) scriptLog(msg, 'debug');
+    // INFO-LEVEL erzwungen, damit ioBroker es nicht im Standard-Log ausblendet!
+    if (CONFIG.enableDebug) scriptLog(msg, 'info'); 
   }
 
   function clearSideTimer(side) {
@@ -124,12 +132,11 @@
 
   if (hasMissingDP) {
     scriptLog('Skriptabbruch! Es fehlen Datenpunkte. Keine Trigger registriert.', 'error');
-    return; // Beendet die IIFE hier -> Skript läuft nicht weiter
+    return;
   }
   
   scriptLog('Systemprüfung bestanden. Alle Datenpunkte vorhanden.', 'info');
 
-  // Skript-Stop-Handler (Verhindert Memory Leaks/Geister-Schaltungen beim Neustart)
   onStop(function() {
     clearAllTimers();
     scriptLog('Skript wurde gestoppt. Alle aktiven Beleuchtungs-Timer wurden bereinigt.', 'info');
@@ -141,42 +148,52 @@
   function getSideStates(side) {
     return {
       motion: parseBool(getState(DP[side].motion)?.val),
-      matte:  parseBool(getState(DP[side].matte)?.val)
+      isOccupied: getMatteOccupiedState(getState(DP[side].matte)?.val)
     };
   }
 
-  function setLight(side, state) { // state ist immer sauberes true/false
+  function setLight(side, state) {
     const ledId = DP[side].led;
     const rawCurrent = getState(ledId)?.val;
     const currentVal = parseBool(rawCurrent);
 
-    // Nur schalten, wenn sich der Zustand ändert (Zigbee-Schonung)
-    if (currentVal === state) {
-      debugLog(`Licht ${side}: bereits ${state ? 'AN' : 'AUS'} (RAW war: ${rawCurrent}), kein Schaltbefehl`);
+    if (!CONFIG.forceSend && currentVal === state) {
+      debugLog(`Licht ${side}: bereits ${state ? 'AN' : 'AUS'}, blockiert durch Schonung`);
       return;
     }
 
-    setState(ledId, state);
-    scriptLog(`Licht ${side}: ${state ? 'AN' : 'AUS'}`, 'info');
+    // Kompatibilitäts-Layer: Sende als String falls konfiguriert
+    let payload = state; 
+    if (CONFIG.sendAsString) {
+      payload = state ? 'ON' : 'OFF';
+    }
+
+    // WICHTIG: Das 'false' als 3. Parameter ist das ack-Flag. 
+    // false = Befehl an Hardware senden (Command), true = Nur Status in DB aktualisieren
+    setState(ledId, payload, false);
+    scriptLog(`Licht ${side}: ${state ? 'AN' : 'AUS'} (Befehl gesendet als: ${payload})`, 'info');
   }
 
   // ============================================
   // Hauptlogik: Seite verarbeiten
   // ============================================
   function processSide(side, isMotion, isMatteOccupied, nachtVal) {
-    // Nur bei Nacht verarbeiten
-    if (nachtVal !== CONFIG.nachtWert) {
+    const isNight = (nachtVal === CONFIG.nachtWert);
+    const isMatteEmpty = !isMatteOccupied;
+
+    // DIAGNOSE-LOG (Jetzt für dich sichtbar!)
+    debugLog(`[Logik-Prüfung ${side}] Nacht? ${isNight} ('${nachtVal}') | Matte leer? ${isMatteEmpty} (Occupied:${isMatteOccupied}) | Bewegung? ${isMotion}`);
+
+    if (!isNight) {
       setLight(side, false);
       clearSideTimer(side);
       return;
     }
 
-    // Logik: Matte = false (niemand im Bett) UND Motion = true (Bewegung)
-    if (!isMatteOccupied && isMotion) {
-      // Licht einschalten
+    // Logik: Matte = leer UND Motion = true
+    if (isMatteEmpty && isMotion) {
       setLight(side, true);
 
-      // Vorherigen Timer löschen und neuen setzen
       clearSideTimer(side);
       TIMERS[side] = setTimeout(() => {
         setLight(side, false);
@@ -185,7 +202,6 @@
 
       debugLog(`Timer ${side} gestartet (${CONFIG.timerMs / 60000} Min)`);
     } else if (isMatteOccupied) {
-      // Person im Bett → Licht aus, Timer löschen
       setLight(side, false);
       clearSideTimer(side);
       debugLog(`Seite ${side}: Person im Bett, Licht bleibt AUS`);
@@ -193,28 +209,28 @@
   }
 
   // ============================================
-  // Trigger Generierung (DRY - mit sicherem obj.state & change:any!)
+  // Trigger Generierung
   // ============================================
   ['links', 'rechts'].forEach(side => {
     
-    // Trigger: Bewegung (change: 'any' garantiert, dass ein Zigbee-Retrigger "true" -> "true" erfasst wird)
+    // Trigger: Bewegung
     on({ id: DP[side].motion, change: 'any' }, function(obj) {
       const motionVal = parseBool(obj.state?.val);
-      const matteVal  = parseBool(getState(DP[side].matte)?.val);
+      const isOccupied = getMatteOccupiedState(getState(DP[side].matte)?.val);
       const nachtVal  = getState(DP.nacht)?.val ?? CONFIG.defaultNachtWert;
       
-      debugLog(`[Trigger Bewegung ${side}] Motion RAW: ${obj.state?.val} -> normiert: ${motionVal} | Matte normiert: ${matteVal}`);
-      processSide(side, motionVal, matteVal, nachtVal);
+      debugLog(`[Trigger Bewegung ${side}] Motion RAW: ${obj.state?.val} -> normiert: ${motionVal}`);
+      processSide(side, motionVal, isOccupied, nachtVal);
     });
 
     // Trigger: Kontaktmatte
     on({ id: DP[side].matte, change: 'any' }, function(obj) {
-      const matteVal  = parseBool(obj.state?.val);
+      const isOccupied = getMatteOccupiedState(obj.state?.val);
       const motionVal = parseBool(getState(DP[side].motion)?.val);
       const nachtVal  = getState(DP.nacht)?.val ?? CONFIG.defaultNachtWert;
       
-      debugLog(`[Trigger Matte ${side}] Matte RAW: ${obj.state?.val} -> normiert: ${matteVal} | Motion normiert: ${motionVal}`);
-      processSide(side, motionVal, matteVal, nachtVal);
+      debugLog(`[Trigger Matte ${side}] Matte RAW: ${obj.state?.val} -> Belegt: ${isOccupied}`);
+      processSide(side, motionVal, isOccupied, nachtVal);
     });
 
   });
@@ -222,24 +238,21 @@
   // ============================================
   // Trigger: Tag/Nacht Wechsel
   // ============================================
-  // Hier reicht change: 'ne' (not equal), da Tag/Nacht sich immer sauber abwechselt
   on({ id: DP.nacht, change: 'ne' }, function(obj) {
     const nachtVal = obj.state?.val ?? CONFIG.defaultNachtWert;
 
     if (nachtVal !== CONFIG.nachtWert) {
-      // Tag → beide Lichter aus, Timer explizit löschen
       setLight('links', false);
       setLight('rechts', false);
       clearAllTimers();
-      scriptLog('INFO: Tag erkannt → Beleuchtung deaktiviert, alle aktiven Timer wurden gelöscht.', 'info');
+      scriptLog('INFO: Tag erkannt → Beleuchtung deaktiviert, alle aktiven Timer gelöscht.', 'info');
     } else {
       scriptLog('Nacht erkannt → Beleuchtung aktiv, prüfe aktuelle Zustände', 'info');
-      // Bei Nacht-Wechsel beide Seiten prüfen
       const links = getSideStates('links');
       const rechts = getSideStates('rechts');
       
-      processSide('links', links.motion, links.matte, nachtVal);
-      processSide('rechts', rechts.motion, rechts.matte, nachtVal);
+      processSide('links', links.motion, links.isOccupied, nachtVal);
+      processSide('rechts', rechts.motion, rechts.isOccupied, nachtVal);
     }
   });
 
@@ -252,13 +265,10 @@
   const links    = getSideStates('links');
   const rechts   = getSideStates('rechts');
   
-  // Startup-Log für leichteres Debugging
   scriptLog(`Start-Zustände geladen - Modus: ${nachtVal}`, 'info');
-  debugLog(`Werte Links  -> Matte belegt: ${links.matte}, Bewegung: ${links.motion}`);
-  debugLog(`Werte Rechts -> Matte belegt: ${rechts.matte}, Bewegung: ${rechts.motion}`);
   
-  processSide('links', links.motion, links.matte, nachtVal);
-  processSide('rechts', rechts.motion, rechts.matte, nachtVal);
+  processSide('links', links.motion, links.isOccupied, nachtVal);
+  processSide('rechts', rechts.motion, rechts.isOccupied, nachtVal);
   
   scriptLog('Bettbeleuchtung-Skript erfolgreich gestartet.', 'info');
 
