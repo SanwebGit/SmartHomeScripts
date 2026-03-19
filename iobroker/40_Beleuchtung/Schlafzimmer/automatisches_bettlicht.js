@@ -2,10 +2,10 @@
  * ==============================================================================
  * ioBroker Script: Automatische Bettbeleuchtung
  * ==============================================================================
- * @version   1.0.0
+ * @version   1.0.2
  * @author    Sanweb
  * @license   MIT License
- * * @description
+ * @description
  * Automatische Bettbeleuchtung mit Nacht-Logik.
  * Logik: Licht nur bei Nacht, wenn Kontaktmatte=false UND Bewegung=true.
  * Timer: 2 Minuten, retriggert bei erneuter Bewegung.
@@ -18,10 +18,10 @@
   // Konfiguration
   // ============================================
   const CONFIG = {
-    timerMs: 2 * 60 * 1000,  // 2 Minuten Timer-Dauer
-    defaultNachtWert: 'Tag', // Fallback-Wert für Tag/Nacht
-    nachtWert: 'Nacht',      // Expliziter Vergleichswert für Nacht
-    enableDebug: true,       // Debug-Logging steuern (auf false setzen für produktiven, leisen Betrieb)
+    timerMs: 2 * 60 * 1000,   // 2 Minuten Timer-Dauer
+    defaultNachtWert: 'Tag',  // Fallback-Wert für Tag/Nacht
+    nachtWert: 'Nacht',       // Expliziter Vergleichswert für Nacht
+    enableDebug: true,        // Debug-Logging steuern (auf false setzen für produktiven, leisen Betrieb)
     logPrefix: '[Bettlicht] ' // Präfix für alle Log-Ausgaben zur besseren Übersicht
   };
 
@@ -30,12 +30,12 @@
   // ============================================
   const DP = {
     links: {
-      led:      'zigbee2mqtt.0.0xa4c13852a863096b.state',      // Zigbee LED-Lichtschalter
+      led:      'zigbee2mqtt.0.0xa4c13852a863096b.state',     // Zigbee LED-Lichtschalter
       motion:   'zigbee2mqtt.0.0xa4c1387d7ee56494.presence',  // Zigbee Bewegungsmelder
       matte:    'hm-rpc.0.001E1D899E94B0.1.STATE'             // Homematic Kontaktmatte (Bett belegt)
     },
     rechts: {
-      led:      'zigbee2mqtt.0.0xa4c138da7c22e582.state',      // Zigbee LED-Lichtschalter
+      led:      'zigbee2mqtt.0.0xa4c138da7c22e582.state',     // Zigbee LED-Lichtschalter
       motion:   'zigbee2mqtt.0.0xa4c138f5aeea45b6.presence',  // Zigbee Bewegungsmelder
       matte:    'hm-rpc.0.001E1D899E922D.1.STATE'             // Homematic Kontaktmatte (Bett belegt)
     },
@@ -47,6 +47,31 @@
     links: null,
     rechts: null
   };
+
+  // ============================================
+  // Hilfsfunktionen: Datentypen normieren
+  // ============================================
+  
+  /**
+   * Universal-Übersetzer für ioBroker-Datentypen.
+   * Macht aus 1, "1", "true", true immer ein echtes true.
+   * Macht aus 0, "0", "false", false immer ein echtes false.
+   */
+  function parseBool(val) {
+    if (val === null || val === undefined) return false;
+    
+    if (typeof val === 'string') {
+      const lower = val.trim().toLowerCase();
+      if (lower === 'true' || lower === '1' || lower === 'on') return true;
+      if (lower === 'false' || lower === '0' || lower === 'off') return false;
+    }
+    
+    if (typeof val === 'number') {
+      return val > 0;
+    }
+    
+    return Boolean(val);
+  }
 
   // ============================================
   // Hilfsfunktionen: Logging & Timer Cleanup
@@ -115,19 +140,19 @@
   // ============================================
   function getSideStates(side) {
     return {
-      motion: getState(DP[side].motion)?.val ?? false,
-      matte:  getState(DP[side].matte)?.val ?? false
+      motion: parseBool(getState(DP[side].motion)?.val),
+      matte:  parseBool(getState(DP[side].matte)?.val)
     };
   }
 
-  function setLight(side, state) {
+  function setLight(side, state) { // state ist immer sauberes true/false
     const ledId = DP[side].led;
-    // Typsicherheit: Falls getState null zurückgibt, gehen wir von false (aus) aus
-    const currentVal = getState(ledId)?.val ?? false;
+    const rawCurrent = getState(ledId)?.val;
+    const currentVal = parseBool(rawCurrent);
 
     // Nur schalten, wenn sich der Zustand ändert (Zigbee-Schonung)
     if (currentVal === state) {
-      debugLog(`Licht ${side}: bereits ${state ? 'AN' : 'AUS'}, kein Schaltbefehl`);
+      debugLog(`Licht ${side}: bereits ${state ? 'AN' : 'AUS'} (RAW war: ${rawCurrent}), kein Schaltbefehl`);
       return;
     }
 
@@ -138,7 +163,7 @@
   // ============================================
   // Hauptlogik: Seite verarbeiten
   // ============================================
-  function processSide(side, motionVal, matteVal, nachtVal) {
+  function processSide(side, isMotion, isMatteOccupied, nachtVal) {
     // Nur bei Nacht verarbeiten
     if (nachtVal !== CONFIG.nachtWert) {
       setLight(side, false);
@@ -146,8 +171,8 @@
       return;
     }
 
-    // Logik: Matte=false (niemand im Bett) UND Motion=true (Bewegung)
-    if (matteVal === false && motionVal === true) {
+    // Logik: Matte = false (niemand im Bett) UND Motion = true (Bewegung)
+    if (!isMatteOccupied && isMotion) {
       // Licht einschalten
       setLight(side, true);
 
@@ -159,7 +184,7 @@
       }, CONFIG.timerMs);
 
       debugLog(`Timer ${side} gestartet (${CONFIG.timerMs / 60000} Min)`);
-    } else if (matteVal === true) {
+    } else if (isMatteOccupied) {
       // Person im Bett → Licht aus, Timer löschen
       setLight(side, false);
       clearSideTimer(side);
@@ -168,23 +193,37 @@
   }
 
   // ============================================
-  // Trigger Generierung (DRY)
+  // Trigger Generierung (DRY - mit sicherem obj.state & change:any!)
   // ============================================
   ['links', 'rechts'].forEach(side => {
-    function handleTrigger() {
-      const states = getSideStates(side);
-      const nachtVal = getState(DP.nacht)?.val ?? CONFIG.defaultNachtWert;
-      processSide(side, states.motion, states.matte, nachtVal);
-    }
+    
+    // Trigger: Bewegung (change: 'any' garantiert, dass ein Zigbee-Retrigger "true" -> "true" erfasst wird)
+    on({ id: DP[side].motion, change: 'any' }, function(obj) {
+      const motionVal = parseBool(obj.state?.val);
+      const matteVal  = parseBool(getState(DP[side].matte)?.val);
+      const nachtVal  = getState(DP.nacht)?.val ?? CONFIG.defaultNachtWert;
+      
+      debugLog(`[Trigger Bewegung ${side}] Motion RAW: ${obj.state?.val} -> normiert: ${motionVal} | Matte normiert: ${matteVal}`);
+      processSide(side, motionVal, matteVal, nachtVal);
+    });
 
-    on(DP[side].motion, handleTrigger);
-    on(DP[side].matte, handleTrigger);
+    // Trigger: Kontaktmatte
+    on({ id: DP[side].matte, change: 'any' }, function(obj) {
+      const matteVal  = parseBool(obj.state?.val);
+      const motionVal = parseBool(getState(DP[side].motion)?.val);
+      const nachtVal  = getState(DP.nacht)?.val ?? CONFIG.defaultNachtWert;
+      
+      debugLog(`[Trigger Matte ${side}] Matte RAW: ${obj.state?.val} -> normiert: ${matteVal} | Motion normiert: ${motionVal}`);
+      processSide(side, motionVal, matteVal, nachtVal);
+    });
+
   });
 
   // ============================================
   // Trigger: Tag/Nacht Wechsel
   // ============================================
-  on(DP.nacht, function(obj) {
+  // Hier reicht change: 'ne' (not equal), da Tag/Nacht sich immer sauber abwechselt
+  on({ id: DP.nacht, change: 'ne' }, function(obj) {
     const nachtVal = obj.state?.val ?? CONFIG.defaultNachtWert;
 
     if (nachtVal !== CONFIG.nachtWert) {
