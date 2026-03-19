@@ -2,7 +2,7 @@
  * ==============================================================================
  * ioBroker Script: Automatische Bettbeleuchtung
  * ==============================================================================
- * @version   1.0.8
+ * @version   1.1.0
  * @author    Sanweb
  * @license   MIT License
  * @description
@@ -22,10 +22,8 @@
     defaultNachtWert: 'Tag',  // Fallback-Wert für Tag/Nacht
     nachtWert: 'Nacht',       // Expliziter Vergleichswert für Nacht. ACHTUNG: Groß/Kleinschreibung beachten!
     enableDebug: true,        // Diagnose-Logging steuern
-    forceSend: true,          // HACK: Auf true setzen, um die Zigbee-Schonung zu ignorieren (wird bei useToggle ignoriert!)
+    forceSend: true,          // Empfohlen bei MQTT .set Datenpunkten: Befehle immer senden
     invertMatte: true,        // Auf true setzen, falls die Matte 1/true sendet, wenn sie LEER ist
-    sendAsString: false,      // Setze auf true, falls Zigbee2MQTT zwingend "ON"/"OFF" als Text verlangt
-    useToggle: true,          // FIX: Nutzt den state_toggle Button zum Schalten, liest aber den Status von state (für zickige Zigbee-Relais)
     logPrefix: '[Bettlicht] ' // Präfix für alle Log-Ausgaben
   };
 
@@ -34,18 +32,16 @@
   // ============================================
   const DP = {
     links: {
-      led:      'zigbee2mqtt.0.0xa4c13852a863096b.state',        // Lese-Status der LED
-      toggle:   'zigbee2mqtt.0.0xa4c13852a863096b.state_toggle', // Toggle-Button der LED
-      motion:   'zigbee2mqtt.0.0xa4c1387d7ee56494.presence',     // Zigbee Bewegungsmelder
-      matte:    'hm-rpc.0.001E1D899E94B0.1.STATE'                // Homematic Kontaktmatte
+      ledCmd:   'mqtt.1.zigbee2mqtt.Bettlicht_Rosie.set',     // MQTT Set-Datenpunkt für links
+      motion:   'zigbee2mqtt.0.0xa4c1387d7ee56494.presence',  // Zigbee Bewegungsmelder
+      matte:    'hm-rpc.0.001E1D899E94B0.1.STATE'             // Homematic Kontaktmatte
     },
     rechts: {
-      led:      'zigbee2mqtt.0.0xa4c138da7c22e582.state',        // Lese-Status der LED
-      toggle:   'zigbee2mqtt.0.0xa4c138da7c22e582.state_toggle', // Toggle-Button der LED
-      motion:   'zigbee2mqtt.0.0xa4c138f5aeea45b6.presence',     // Zigbee Bewegungsmelder
-      matte:    'hm-rpc.0.001E1D899E922D.1.STATE'                // Homematic Kontaktmatte
+      ledCmd:   'mqtt.1.zigbee2mqtt.Bettlicht_Alex.set',      // MQTT Set-Datenpunkt für rechts
+      motion:   'zigbee2mqtt.0.0xa4c138f5aeea45b6.presence',  // Zigbee Bewegungsmelder
+      matte:    'hm-rpc.0.001E1D899E922D.1.STATE'             // Homematic Kontaktmatte
     },
-    nacht:    '0_userdata.0.System.Astro.TagNacht'               // Globale Astro-Variable (Tag/Nacht)
+    nacht:    '0_userdata.0.System.Astro.TagNacht'            // Globale Astro-Variable (Tag/Nacht)
   };
 
   // Timer-Referenz-Objekt
@@ -58,20 +54,12 @@
   // Hilfsfunktionen: Datentypen normieren
   // ============================================
   
+  /**
+   * Kompakte Prüfung für Sensor-Eingänge (Motion & Matte).
+   * Erfasst true, "true", 1 und "1" sicher als wahr. Alles andere ist false.
+   */
   function parseBool(val) {
-    if (val === null || val === undefined) return false;
-    
-    if (typeof val === 'string') {
-      const lower = val.trim().toLowerCase();
-      if (lower === 'true' || lower === '1' || lower === 'on') return true;
-      if (lower === 'false' || lower === '0' || lower === 'off') return false;
-    }
-    
-    if (typeof val === 'number') {
-      return val > 0;
-    }
-    
-    return Boolean(val);
+    return (val === true || val === 'true' || val === 1 || val === '1');
   }
 
   // Wandelt den rohen Mattenwert in einen logischen "Belegt"-Zustand um
@@ -118,9 +106,39 @@
   // ============================================
   scriptLog('Führe Systemprüfung der Datenpunkte durch...', 'info');
   
+  // MQTT Datenpunkte prüfen und ggf. automatisch anlegen
+  const mqttDPs = [DP.links.ledCmd, DP.rechts.ledCmd];
+  for (const id of mqttDPs) {
+    if (!existsState(id)) {
+      scriptLog(`MQTT Datenpunkt ${id} fehlt. Versuche Erstellung in fremdem Namensraum...`, 'warn');
+      
+      setObject(id, {
+        type: 'state',
+        common: {
+          name: id.split('.').pop(),
+          type: 'string',
+          role: 'state',
+          read: true,
+          write: true,
+          desc: 'Automatisch angelegt durch Bettlicht-Skript'
+        },
+        native: {}
+      }, function(err) {
+        if (err) {
+          scriptLog(`FEHLER beim Anlegen von ${id}: ${err} -> Bitte in den JavaScript-Instanz-Einstellungen "Erlaube das Kommando setObj" aktivieren!`, 'error');
+        } else {
+          scriptLog(`Erfolgreich angelegt: ${id}`, 'info');
+          // Startwert setzen
+          setState(id, JSON.stringify({ state: "OFF" }), true);
+        }
+      });
+    }
+  }
+
+  // Für Sensoren wird strikt geprüft (Skriptabbruch bei Fehlen)
   const requiredDPs = [
-    DP.links.led, DP.links.toggle, DP.links.motion, DP.links.matte,
-    DP.rechts.led, DP.rechts.toggle, DP.rechts.motion, DP.rechts.matte,
+    DP.links.motion, DP.links.matte,
+    DP.rechts.motion, DP.rechts.matte,
     DP.nacht
   ];
   
@@ -155,35 +173,21 @@
   }
 
   function setLight(side, state) {
-    const ledId = DP[side].led;
-    const rawCurrent = getState(ledId)?.val;
-    const currentVal = parseBool(rawCurrent);
+    const ledCmdId = DP[side].ledCmd;
+    const payloadString = JSON.stringify({ state: state ? "ON" : "OFF" });
 
-    // TOGGLE-MODUS (Hardware Workaround)
-    if (CONFIG.useToggle) {
-      if (currentVal === state) {
-        debugLog(`Licht ${side}: ist bereits ${state ? 'AN' : 'AUS'} (RAW: ${rawCurrent}), Toggle wird übersprungen`);
-        return;
-      }
-      const toggleId = DP[side].toggle;
-      setState(toggleId, true, false); // Button in ioBroker drücken
-      scriptLog(`Licht ${side}: ${state ? 'AN' : 'AUS'} (Befehl gesendet via TOGGLE)`, 'info');
-      return;
-    }
+    // Letzter gesendeter Befehl (da .set kein echter Status-DP ist, enthält er nur den letzten String)
+    const rawCurrent = existsState(ledCmdId) ? getState(ledCmdId)?.val : null;
 
-    // NORMALER MODUS
-    if (!CONFIG.forceSend && currentVal === state) {
+    if (!CONFIG.forceSend && rawCurrent === payloadString) {
       debugLog(`Licht ${side}: bereits ${state ? 'AN' : 'AUS'}, blockiert durch Schonung`);
       return;
     }
 
-    let payload = state; 
-    if (CONFIG.sendAsString) {
-      payload = state ? 'ON' : 'OFF';
-    }
-
-    setState(ledId, payload, false);
-    scriptLog(`Licht ${side}: ${state ? 'AN' : 'AUS'} (Befehl gesendet als: ${payload})`, 'info');
+    // WICHTIG: Das 'false' als 3. Parameter ist das ack-Flag. 
+    // false = Befehl an Hardware senden (Command)
+    setState(ledCmdId, payloadString, false);
+    scriptLog(`Licht ${side}: ${state ? 'AN' : 'AUS'} (MQTT Payload: ${payloadString})`, 'info');
   }
 
   // ============================================
