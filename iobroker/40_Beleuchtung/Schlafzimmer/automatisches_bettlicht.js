@@ -2,7 +2,7 @@
  * ==============================================================================
  * ioBroker Script: Automatische Bettbeleuchtung
  * ==============================================================================
- * @version   1.0.7
+ * @version   1.0.8
  * @author    Sanweb
  * @license   MIT License
  * @description
@@ -22,9 +22,10 @@
     defaultNachtWert: 'Tag',  // Fallback-Wert für Tag/Nacht
     nachtWert: 'Nacht',       // Expliziter Vergleichswert für Nacht. ACHTUNG: Groß/Kleinschreibung beachten!
     enableDebug: true,        // Diagnose-Logging steuern
-    forceSend: true,          // HACK/FIX: Auf true setzen, um die Zigbee-Schonung zu ignorieren
+    forceSend: true,          // HACK: Auf true setzen, um die Zigbee-Schonung zu ignorieren (wird bei useToggle ignoriert!)
     invertMatte: true,        // Auf true setzen, falls die Matte 1/true sendet, wenn sie LEER ist
-    sendAsString: false,      // NEU: Setze auf true, falls Zigbee2MQTT zwingend "ON"/"OFF" als Text statt true/false verlangt
+    sendAsString: false,      // Setze auf true, falls Zigbee2MQTT zwingend "ON"/"OFF" als Text verlangt
+    useToggle: true,          // FIX: Nutzt den state_toggle Button zum Schalten, liest aber den Status von state (für zickige Zigbee-Relais)
     logPrefix: '[Bettlicht] ' // Präfix für alle Log-Ausgaben
   };
 
@@ -33,16 +34,18 @@
   // ============================================
   const DP = {
     links: {
-      led:      'zigbee2mqtt.0.0xa4c13852a863096b.state',     // Zigbee LED (ID endet auf .state, Rolle ist switch)
-      motion:   'zigbee2mqtt.0.0xa4c1387d7ee56494.presence',  // Zigbee Bewegungsmelder
-      matte:    'hm-rpc.0.001E1D899E94B0.1.STATE'             // Homematic Kontaktmatte
+      led:      'zigbee2mqtt.0.0xa4c13852a863096b.state',        // Lese-Status der LED
+      toggle:   'zigbee2mqtt.0.0xa4c13852a863096b.state_toggle', // Toggle-Button der LED
+      motion:   'zigbee2mqtt.0.0xa4c1387d7ee56494.presence',     // Zigbee Bewegungsmelder
+      matte:    'hm-rpc.0.001E1D899E94B0.1.STATE'                // Homematic Kontaktmatte
     },
     rechts: {
-      led:      'zigbee2mqtt.0.0xa4c138da7c22e582.state',     // Zigbee LED (ID endet auf .state, Rolle ist switch)
-      motion:   'zigbee2mqtt.0.0xa4c138f5aeea45b6.presence',  // Zigbee Bewegungsmelder
-      matte:    'hm-rpc.0.001E1D899E922D.1.STATE'             // Homematic Kontaktmatte
+      led:      'zigbee2mqtt.0.0xa4c138da7c22e582.state',        // Lese-Status der LED
+      toggle:   'zigbee2mqtt.0.0xa4c138da7c22e582.state_toggle', // Toggle-Button der LED
+      motion:   'zigbee2mqtt.0.0xa4c138f5aeea45b6.presence',     // Zigbee Bewegungsmelder
+      matte:    'hm-rpc.0.001E1D899E922D.1.STATE'                // Homematic Kontaktmatte
     },
-    nacht:    '0_userdata.0.System.Astro.TagNacht'            // Globale Astro-Variable (Tag/Nacht)
+    nacht:    '0_userdata.0.System.Astro.TagNacht'               // Globale Astro-Variable (Tag/Nacht)
   };
 
   // Timer-Referenz-Objekt
@@ -94,7 +97,6 @@
   }
 
   function debugLog(msg) {
-    // INFO-LEVEL erzwungen, damit ioBroker es nicht im Standard-Log ausblendet!
     if (CONFIG.enableDebug) scriptLog(msg, 'info'); 
   }
 
@@ -117,8 +119,8 @@
   scriptLog('Führe Systemprüfung der Datenpunkte durch...', 'info');
   
   const requiredDPs = [
-    DP.links.led, DP.links.motion, DP.links.matte,
-    DP.rechts.led, DP.rechts.motion, DP.rechts.matte,
+    DP.links.led, DP.links.toggle, DP.links.motion, DP.links.matte,
+    DP.rechts.led, DP.rechts.toggle, DP.rechts.motion, DP.rechts.matte,
     DP.nacht
   ];
   
@@ -157,19 +159,29 @@
     const rawCurrent = getState(ledId)?.val;
     const currentVal = parseBool(rawCurrent);
 
+    // TOGGLE-MODUS (Hardware Workaround)
+    if (CONFIG.useToggle) {
+      if (currentVal === state) {
+        debugLog(`Licht ${side}: ist bereits ${state ? 'AN' : 'AUS'} (RAW: ${rawCurrent}), Toggle wird übersprungen`);
+        return;
+      }
+      const toggleId = DP[side].toggle;
+      setState(toggleId, true, false); // Button in ioBroker drücken
+      scriptLog(`Licht ${side}: ${state ? 'AN' : 'AUS'} (Befehl gesendet via TOGGLE)`, 'info');
+      return;
+    }
+
+    // NORMALER MODUS
     if (!CONFIG.forceSend && currentVal === state) {
       debugLog(`Licht ${side}: bereits ${state ? 'AN' : 'AUS'}, blockiert durch Schonung`);
       return;
     }
 
-    // Kompatibilitäts-Layer: Sende als String falls konfiguriert
     let payload = state; 
     if (CONFIG.sendAsString) {
       payload = state ? 'ON' : 'OFF';
     }
 
-    // WICHTIG: Das 'false' als 3. Parameter ist das ack-Flag. 
-    // false = Befehl an Hardware senden (Command), true = Nur Status in DB aktualisieren
     setState(ledId, payload, false);
     scriptLog(`Licht ${side}: ${state ? 'AN' : 'AUS'} (Befehl gesendet als: ${payload})`, 'info');
   }
@@ -181,7 +193,6 @@
     const isNight = (nachtVal === CONFIG.nachtWert);
     const isMatteEmpty = !isMatteOccupied;
 
-    // DIAGNOSE-LOG (Jetzt für dich sichtbar!)
     debugLog(`[Logik-Prüfung ${side}] Nacht? ${isNight} ('${nachtVal}') | Matte leer? ${isMatteEmpty} (Occupied:${isMatteOccupied}) | Bewegung? ${isMotion}`);
 
     if (!isNight) {
