@@ -2,7 +2,7 @@
  * ==============================================================================
  * ioBroker Script: Automatische Bettbeleuchtung
  * ==============================================================================
- * @version   1.1.3
+ * @version   1.2.0 (Native Zigbee2MQTT Version)
  * @author    Sanweb
  * @license   MIT License
  * @description
@@ -20,26 +20,24 @@
   const CONFIG = {
     timerMs: 2 * 60 * 1000,   // 2 Minuten Timer-Dauer
     defaultNachtWert: 'Tag',  // Fallback-Wert für Tag/Nacht
-    nachtWert: 'Nacht',       // Expliziter Vergleichswert für Nacht. ACHTUNG: Groß/Kleinschreibung beachten!
+    nachtWert: 'Nacht',       // Expliziter Vergleichswert für Nacht.
     enableDebug: true,        // Diagnose-Logging steuern
-    forceSend: true,          // Empfohlen bei MQTT .set Datenpunkten: Befehle immer senden
+    forceSend: true,          // true = Befehle immer senden (auch wenn Status schon scheinbar korrekt)
     invertMatte: true,        // Auf true setzen, falls die Matte 1/true sendet, wenn sie LEER ist
     logPrefix: '[Bettlicht] ' // Präfix für alle Log-Ausgaben
   };
 
   // ============================================
-  // Datenpunkte
+  // Datenpunkte (Native Zigbee2MQTT)
   // ============================================
   const DP = {
     links: {
-      ledCmd:   'mqtt.1.zigbee2mqtt.Bettlicht Rosie.set',     // ioBroker ID (ohne Unterstrich)
-      ledTopic: 'zigbee2mqtt/Bettlicht Rosie/set',            // Echtes MQTT Topic
+      ledCmd:   'zigbee2mqtt.0.0xa4c13852a863096b.state',     // Native LED State (Links)
       motion:   'zigbee2mqtt.0.0xa4c1387d7ee56494.presence',  // Zigbee Bewegungsmelder
       matte:    'hm-rpc.0.001E1D899E94B0.1.STATE'             // Homematic Kontaktmatte
     },
     rechts: {
-      ledCmd:   'mqtt.1.zigbee2mqtt.Bettlicht Alex.set',      // ioBroker ID (ohne Unterstrich)
-      ledTopic: 'zigbee2mqtt/Bettlicht Alex/set',             // Echtes MQTT Topic
+      ledCmd:   'zigbee2mqtt.0.0xa4c138da7c22e582.state',     // Native LED State (Rechts)
       motion:   'zigbee2mqtt.0.0xa4c138f5aeea45b6.presence',  // Zigbee Bewegungsmelder
       matte:    'hm-rpc.0.001E1D899E922D.1.STATE'             // Homematic Kontaktmatte
     },
@@ -56,19 +54,14 @@
   // Hilfsfunktionen: Datentypen normieren
   // ============================================
   
-  /**
-   * Kompakte Prüfung für Sensor-Eingänge (Motion & Matte).
-   * Erfasst true, "true", 1 und "1" sicher als wahr. Alles andere ist false.
-   */
   function parseBool(val) {
     return (val === true || val === 'true' || val === 1 || val === '1');
   }
 
-  // Wandelt den rohen Mattenwert in einen logischen "Belegt"-Zustand um
   function getMatteOccupiedState(rawVal) {
     let isOccupied = parseBool(rawVal);
     if (CONFIG.invertMatte) {
-      isOccupied = !isOccupied; // Dreht die Logik um, falls invertMatte true ist
+      isOccupied = !isOccupied; 
     }
     return isOccupied;
   }
@@ -102,46 +95,10 @@
   // Systemprüfung: Vorhandensein der Datenpunkte
   // ============================================
   scriptLog('Führe Systemprüfung der Datenpunkte durch...', 'info');
-  
-  // MQTT Datenpunkte prüfen und ggf. automatisch mit exaktem Topic anlegen
-  const mqttTargets = [
-    { id: DP.links.ledCmd, topic: DP.links.ledTopic },
-    { id: DP.rechts.ledCmd, topic: DP.rechts.ledTopic }
-  ];
 
-  for (const target of mqttTargets) {
-    if (!existsState(target.id)) {
-      scriptLog(`MQTT Datenpunkt ${target.id} fehlt. Wird mit Ziel-Topic "${target.topic}" angelegt...`, 'warn');
-      
-      setObject(target.id, {
-        type: 'state',
-        common: {
-          name: 'set',
-          type: 'string',
-          role: 'state',
-          read: true,
-          write: true,
-          desc: 'Automatisch angelegt durch Bettlicht-Skript'
-        },
-        native: {
-          topic: target.topic // <--- HIER IST DIE MAGIE: Das exakte MQTT Topic für den Adapter!
-        }
-      }, function(err) {
-        if (err) {
-          scriptLog(`FEHLER beim Anlegen von ${target.id}: ${err}`, 'error');
-        } else {
-          scriptLog(`Erfolgreich angelegt: ${target.id}`, 'info');
-          // Startwert setzen
-          setState(target.id, JSON.stringify({ state: "OFF" }), true);
-        }
-      });
-    }
-  }
-
-  // Für Sensoren wird strikt geprüft (Skriptabbruch bei Fehlen)
   const requiredDPs = [
-    DP.links.motion, DP.links.matte,
-    DP.rechts.motion, DP.rechts.matte,
+    DP.links.ledCmd, DP.links.motion, DP.links.matte,
+    DP.rechts.ledCmd, DP.rechts.motion, DP.rechts.matte,
     DP.nacht
   ];
   
@@ -177,17 +134,17 @@
 
   function setLight(side, state) {
     const ledCmdId = DP[side].ledCmd;
-    const payloadString = JSON.stringify({ state: state ? "ON" : "OFF" });
-
     const rawCurrent = existsState(ledCmdId) ? getState(ledCmdId)?.val : null;
 
-    if (!CONFIG.forceSend && rawCurrent === payloadString) {
+    // Nur schalten, wenn forceSend aktiv ist oder der Zustand abweicht
+    if (!CONFIG.forceSend && rawCurrent === state) {
       debugLog(`Licht ${side}: bereits ${state ? 'AN' : 'AUS'}, blockiert durch Schonung`);
       return;
     }
 
-    setState(ledCmdId, payloadString, false);
-    scriptLog(`Licht ${side}: ${state ? 'AN' : 'AUS'} (MQTT Payload: ${payloadString})`, 'info');
+    // Nativer Blockly-Weg: Boolean senden mit ack=false (als 3. Parameter explizit auf false)
+    setState(ledCmdId, state, false);
+    scriptLog(`Licht ${side}: ${state ? 'AN' : 'AUS'} (Native State: ${state})`, 'info');
   }
 
   // ============================================
@@ -197,7 +154,7 @@
     const isNight = (nachtVal === CONFIG.nachtWert);
     const isMatteEmpty = !isMatteOccupied;
 
-    debugLog(`[Logik-Prüfung ${side}] Nacht? ${isNight} ('${nachtVal}') | Matte leer? ${isMatteEmpty} (Occupied:${isMatteOccupied}) | Bewegung? ${isMotion}`);
+    debugLog(`[Logik-Prüfung ${side}] Nacht? ${isNight} ('${nachtVal}') | Matte leer? ${isMatteEmpty} | Bewegung? ${isMotion}`);
 
     if (!isNight) {
       setLight(side, false);
@@ -218,7 +175,6 @@
     } else if (isMatteOccupied) {
       setLight(side, false);
       clearSideTimer(side);
-      debugLog(`Seite ${side}: Person im Bett, Licht bleibt AUS`);
     }
   }
 
@@ -232,7 +188,7 @@
       const isOccupied = getMatteOccupiedState(getState(DP[side].matte)?.val);
       const nachtVal  = getState(DP.nacht)?.val ?? CONFIG.defaultNachtWert;
       
-      debugLog(`[Trigger Bewegung ${side}] Motion RAW: ${obj.state?.val} -> normiert: ${motionVal}`);
+      debugLog(`[Trigger Bewegung ${side}] Motion: ${motionVal}`);
       processSide(side, motionVal, isOccupied, nachtVal);
     });
 
@@ -241,7 +197,7 @@
       const motionVal = parseBool(getState(DP[side].motion)?.val);
       const nachtVal  = getState(DP.nacht)?.val ?? CONFIG.defaultNachtWert;
       
-      debugLog(`[Trigger Matte ${side}] Matte RAW: ${obj.state?.val} -> Belegt: ${isOccupied}`);
+      debugLog(`[Trigger Matte ${side}] Belegt: ${isOccupied}`);
       processSide(side, motionVal, isOccupied, nachtVal);
     });
 
@@ -257,7 +213,7 @@
       setLight('links', false);
       setLight('rechts', false);
       clearAllTimers();
-      scriptLog('INFO: Tag erkannt → Beleuchtung deaktiviert, alle aktiven Timer gelöscht.', 'info');
+      scriptLog('INFO: Tag erkannt → Beleuchtung deaktiviert.', 'info');
     } else {
       scriptLog('Nacht erkannt → Beleuchtung aktiv, prüfe aktuelle Zustände', 'info');
       const links = getSideStates('links');
@@ -271,13 +227,11 @@
   // ============================================
   // Initialisierung beim Start
   // ============================================
-  scriptLog('Bettbeleuchtung-Skript wird initialisiert...', 'info');
+  scriptLog('Bettbeleuchtung-Skript (Native Version) wird initialisiert...', 'info');
   
   const nachtVal = getState(DP.nacht)?.val ?? CONFIG.defaultNachtWert;
   const links    = getSideStates('links');
   const rechts   = getSideStates('rechts');
-  
-  scriptLog(`Start-Zustände geladen - Modus: ${nachtVal}`, 'info');
   
   processSide('links', links.motion, links.isOccupied, nachtVal);
   processSide('rechts', rechts.motion, rechts.isOccupied, nachtVal);
