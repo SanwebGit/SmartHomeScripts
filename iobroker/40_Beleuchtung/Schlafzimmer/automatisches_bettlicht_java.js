@@ -70,6 +70,10 @@
   // Hilfsfunktionen: Logging & Timer Cleanup
   // ============================================
   
+  /**
+   * @param {string} msg 
+   * @param {'info' | 'warn' | 'error' | 'debug'} [level='info']
+   */
   function scriptLog(msg, level = 'info') {
     log(CONFIG.logPrefix + msg, level);
   }
