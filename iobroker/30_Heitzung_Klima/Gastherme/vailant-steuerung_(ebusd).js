@@ -98,14 +98,14 @@ const CONFIG = {
 
     // --- H. EBUS-ADAPTER KONFIGURATION ---
     ebus: {
-        setOpModeId: 'mqtt.1.ebusd.700.Z1OpMode.set',
-        setHeatCurveId: 'mqtt.1.ebusd.700.Hc1HeatCurve.set',
-        setDayTempId: 'mqtt.1.ebusd.700.Z1DayTemp.set',
+        setOpModeId: 'mqtt.0.ebusd.700.Z1OpMode.set',
+        setHeatCurveId: 'mqtt.0.ebusd.700.Hc1HeatCurve.set',
+        setDayTempId: 'mqtt.0.ebusd.700.Z1DayTemp.set',
         getFlowTempId: 'hm-rpc.0.002822699B7E84.1.ACTUAL_TEMPERATURE',
         getReturnTempId: 'hm-rpc.0.002822699B7E84.2.ACTUAL_TEMPERATURE',
-        getOpModeId: 'mqtt.1.ebusd.700.Z1OpMode',
-        getRoomTempSwitchOnId: 'mqtt.1.ebusd.700.Hc1RoomTempSwitchOn',
-        setRoomTempSwitchOnId: 'mqtt.1.ebusd.700.Hc1RoomTempSwitchOn.set',
+        getOpModeId: 'mqtt.0.ebusd.700.Z1OpMode',
+        getRoomTempSwitchOnId: 'mqtt.0.ebusd.700.Hc1RoomTempSwitchOn',
+        setRoomTempSwitchOnId: 'mqtt.0.ebusd.700.Hc1RoomTempSwitchOn.set',
     },
 
     // --- I. ioBroker OBJEKT-IDs ---
