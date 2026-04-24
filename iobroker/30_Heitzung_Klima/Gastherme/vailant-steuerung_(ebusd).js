@@ -36,7 +36,7 @@ let cachedMaxKurve = 0;
 // -------------------------------------------------------------------------------------
 const CONFIG = {
     // --- A. GRUNDEINSTELLUNGEN ---
-    logLevel: 'info', // 'debug', 'info', 'warn', 'error'
+    logLevel: 'debug', // 'debug', 'info', 'warn', 'error'
     toleranzTemp: 0.2,
     ventilSchwelle: 0.1, // Ab 10% Ventilöffnung wird Bedarf angemeldet
     

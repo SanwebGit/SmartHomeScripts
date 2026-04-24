@@ -6,8 +6,8 @@
    setStateAsync, setTimeout */
 
 /**
- * @fileoverview Generische Einzelraum-Heizungssteuerung fuer ioBroker
- * @version 9.0 (Paket 4: Solar/Wind-Multiplikator entfernt)
+ * @fileoverview Generische Einzelraum-Heizungssteuerung fuer ioBroker (Paket 3)
+ * @version 8.0 (Strategen-Anbindung ueber Prognose-Datenpunkte)
  * @author Sanweb
  * @license MIT
  *
@@ -22,39 +22,26 @@
  * eigenstaendige Instanz mit eigenem Closure, eigenem Debounce-Manager,
  * eigenen Triggern und eigener Haupt-Logik aufgebaut.
  *
- * NEU in V9.0 (Paket 4 — Entfernung System A / multiplikative Lernwerte):
- * - Das alte Lern-System (lern_skript.js V2.2) ist in Paket 4 durch das
- *   Strategen-System (heizungs_lerner.js V4.0 + stratege.js) vollstaendig
- *   abgeloest. Der multiplikative Solar-/Wind-Korrekturfaktor ist damit
- *   architektonisch ueberfluessig und wird hier entfernt.
- * - Entfernt: ROOMS_CONFIG.lernwerte (alle 5 Raeume)
- * - Entfernt: getStateAsync-Aufrufe fuer solarKorrekturId / windKorrekturId
- * - Entfernt: Multiplikation mit gelernteSolarKorrektur / gelernterWindKorrektur
- *             in 3.1.4.2 Wetter-Analyse
- * - Entfernt: solarKorrekturId / windKorrekturId aus lowPriorityTriggerIds
- * - Log-Format Solar/Wind ohne K-Faktor (z.B. "Solar=-0.50 (F:0.50)")
- *
- * NACH-MIGRATIONS-SCHRITT FUER ALEXANDER:
- *   Nach erfolgreichem Start von V9.0 koennen diese 10 Datenpunkte
- *   gefahrlos aus ioBroker geloescht werden:
- *     0_userdata.0.Heizung.Lernwerte.{Raum}.Solar_Korrektur
- *     0_userdata.0.Heizung.Lernwerte.{Raum}.Wind_Korrektur
- *   fuer Raum in {Wohnzimmer, Schlafzimmer, Badezimmer, Kueche, Esszimmer}.
- *   Optional zusaetzlich: 0_userdata.0.Heizung.Lernwerte.Letzter_Lauf
- *
- * UEBERNOMMEN aus V8.0 (Paket 3):
- * - Strategen-Anbindung ueber Prognose-Datenpunkte (offsetId, vertrauenId)
- * - Clipping auf +/- 2.0 Grad, lineare Vertrauensgewichtung
- * - Zweifeld-Struktur: roomName (Anzeige) + dbRaum (SQL-konform)
+ * NEU in V8.0 (Paket 3 — Strategen-Anbindung):
+ * - Neues Konfigurationsfeld 'prognose' je Raum (offsetId, vertrauenId,
+ *   maxVertrauen, aktiviert)
+ * - Integration des Strategen-Offsets in die Solltemperaturberechnung:
+ *   - Clipping auf +/- 2.0 Grad (Schutz vor DB-Ausreissern)
+ *   - Lineare Gewichtung nach Vertrauen (nutzungs_zaehler / maxVertrauen)
+ *   - Anwendung NACH den Physik-Modulen, VOR dem finalen min/max-Clipping
+ * - Low-Priority-Trigger fuer Prognose-Datenpunkte (nur wenn aktiviert)
+ * - Erweiterter Debug-Log mit Prognose-Details
  *
  * UEBERNOMMEN aus V7.0 (Paket 2):
  * - ROOMS_CONFIG-Array mit allen 5 Raeumen
  * - Fabrik-Funktion createRoomController() pro Raum
  * - Gemeinsamer Schedule (alle 15 Minuten)
  * - Gestaffelter Start (500 ms Versatz je Raum)
+ * - Zweifeld-Struktur: roomName (Anzeige) + dbRaum (SQL-konform)
  *
  * UEBERNOMMENE BUGFIXES aus Paket 1:
  * - Magnus-Formel verwendet Math.log10() (korrekter dekadischer Logarithmus)
+ * - Esszimmer und Kueche mit eigenen, korrekten Lernwerte-Pfaden
  * - Global-Header zur Unterdrueckung von Highlighter-Warnungen
  *
  * ARCHITEKTUR-HINWEIS:
@@ -122,11 +109,10 @@
     //               maxVertrauen  — Schwelle fuer Vollvertrauen (50 = "reifer" Datensatz)
     //               aktiviert     — pro Raum abschaltbar
     //
-    // ENTFERNT in V9.0: Feld 'lernwerte' (siehe Migrations-Hinweis im Header).
-    //
     const ROOMS_CONFIG = [
         // -----------------------------------------------------------------------------
         // RAUM 1: BAD
+        // Quelle: raum_bad.js (Paket 1, V6.15) -> generisches Skript V7.0 (Paket 2)
         // -----------------------------------------------------------------------------
         {
             roomName: 'Bad',
@@ -148,6 +134,10 @@
                 feuchteSensor: 'hm-rpc.2.INT0000002.1.HUMIDITY',
                 wandSensorOberflaeche: 'hm-rpc.0.002822699B7E86.2.ACTUAL_TEMPERATURE',
                 wandSensorKern: 'hm-rpc.0.002822699B7E86.1.ACTUAL_TEMPERATURE',
+            },
+            lernwerte: {
+                solarKorrekturId: '0_userdata.0.Heizung.Lernwerte.Badezimmer.Solar_Korrektur',
+                windKorrekturId: '0_userdata.0.Heizung.Lernwerte.Badezimmer.Wind_Korrektur',
             },
             prognose: {
                 offsetId: '0_userdata.0.Heizung.Prognose.Badezimmer.Empfohlener_Offset',
@@ -175,6 +165,7 @@
 
         // -----------------------------------------------------------------------------
         // RAUM 2: ESSZIMMER
+        // Quelle: raum_esszimmer.js (Paket 1, V6.15) -> generisches Skript V7.0 (Paket 2)
         // -----------------------------------------------------------------------------
         {
             roomName: 'Esszimmer',
@@ -196,6 +187,10 @@
                 feuchteSensor: 'hm-rpc.2.INT0000004.1.HUMIDITY',
                 wandSensorOberflaeche: 'hm-rpc.0.002822699B7E86.1.ACTUAL_TEMPERATURE',
                 wandSensorKern: 'hm-rpc.0.002822699B7E86.2.ACTUAL_TEMPERATURE',
+            },
+            lernwerte: {
+                solarKorrekturId: '0_userdata.0.Heizung.Lernwerte.Esszimmer.Solar_Korrektur',
+                windKorrekturId: '0_userdata.0.Heizung.Lernwerte.Esszimmer.Wind_Korrektur',
             },
             prognose: {
                 offsetId: '0_userdata.0.Heizung.Prognose.Esszimmer.Empfohlener_Offset',
@@ -223,6 +218,7 @@
 
         // -----------------------------------------------------------------------------
         // RAUM 3: KUECHE
+        // Quelle: raum_kueche.js (Paket 1, V6.15) -> generisches Skript V7.0 (Paket 2)
         // -----------------------------------------------------------------------------
         {
             roomName: 'Küche',
@@ -244,6 +240,10 @@
                 feuchteSensor: 'hm-rpc.2.INT0000003.1.HUMIDITY',
                 wandSensorOberflaeche: 'hm-rpc.0.002822699B7E86.1.ACTUAL_TEMPERATURE',
                 wandSensorKern: 'hm-rpc.0.002822699B7E86.2.ACTUAL_TEMPERATURE',
+            },
+            lernwerte: {
+                solarKorrekturId: '0_userdata.0.Heizung.Lernwerte.Kueche.Solar_Korrektur',
+                windKorrekturId: '0_userdata.0.Heizung.Lernwerte.Kueche.Wind_Korrektur',
             },
             prognose: {
                 offsetId: '0_userdata.0.Heizung.Prognose.Kueche.Empfohlener_Offset',
@@ -271,6 +271,7 @@
 
         // -----------------------------------------------------------------------------
         // RAUM 4: SCHLAFZIMMER
+        // Quelle: raum_schlafzimmer.js (Paket 1, V6.15) -> generisches Skript V7.0 (Paket 2)
         // -----------------------------------------------------------------------------
         {
             roomName: 'Schlafzimmer',
@@ -292,6 +293,10 @@
                 feuchteSensor: 'hm-rpc.2.INT0000001.1.HUMIDITY',
                 wandSensorOberflaeche: 'hm-rpc.0.002822699B7D20.1.ACTUAL_TEMPERATURE',
                 wandSensorKern: 'hm-rpc.0.002822699B7D20.2.ACTUAL_TEMPERATURE_STATUS',
+            },
+            lernwerte: {
+                solarKorrekturId: '0_userdata.0.Heizung.Lernwerte.Schlafzimmer.Solar_Korrektur',
+                windKorrekturId: '0_userdata.0.Heizung.Lernwerte.Schlafzimmer.Wind_Korrektur',
             },
             prognose: {
                 offsetId: '0_userdata.0.Heizung.Prognose.Schlafzimmer.Empfohlener_Offset',
@@ -319,6 +324,7 @@
 
         // -----------------------------------------------------------------------------
         // RAUM 5: WOHNZIMMER
+        // Quelle: raum_wohnzimmer.js (Paket 1, V6.15) -> generisches Skript V7.0 (Paket 2)
         // -----------------------------------------------------------------------------
         {
             roomName: 'Wohnzimmer',
@@ -340,6 +346,10 @@
                 feuchteSensor: 'hm-rpc.2.INT0000005.1.HUMIDITY',
                 wandSensorOberflaeche: 'hm-rpc.0.002822699B7D20.1.ACTUAL_TEMPERATURE',
                 wandSensorKern: 'hm-rpc.0.002822699B7D20.2.ACTUAL_TEMPERATURE_STATUS',
+            },
+            lernwerte: {
+                solarKorrekturId: '0_userdata.0.Heizung.Lernwerte.Wohnzimmer.Solar_Korrektur',
+                windKorrekturId: '0_userdata.0.Heizung.Lernwerte.Wohnzimmer.Wind_Korrektur',
             },
             prognose: {
                 offsetId: '0_userdata.0.Heizung.Prognose.Wohnzimmer.Empfohlener_Offset',
@@ -372,18 +382,24 @@
     //    Hauptlogik, Triggern und einem externen main()-Aufruf fuer den
     //    gemeinsamen Schedule.
     // =====================================================================================
+    //
+    // Rueckgabe: { main, triggerCalculation, config }
+    //   main()                = direkter Aufruf der Hauptlogik (fuer Schedule)
+    //   triggerCalculation()  = Debounced Aufruf (fuer Trigger)
+    //   config                = die uebergebene roomConfig (zur Referenz)
+    //
     function createRoomController(roomConfig) {
 
+        // --- Lokaler Closure-State (pro Raum-Instanz) ---
         let debounceTimerHighPriority = null;
         let debounceTimerLowPriority = null;
 
         // =================================================================================
-        // 3.1 HAUPTFUNKTION
+        // 3.1 HAUPTFUNKTION (fuehrt die komplette Raumberechnung aus)
         // =================================================================================
         async function main() {
             try {
-                // --- 3.1.1 Alle Zustaende sammeln ---
-                // ENTFERNT in V9.0: solarKorrekturId / windKorrekturId
+                // --- 3.1.1 Alle Zustaende explizit und sicher sammeln ---
                 const states = {
                     heizPeriode: (await getStateAsync(GLOBAL_IDS.heizPeriode))?.val,
                     anwesenheit: (await getStateAsync(GLOBAL_IDS.anwesenheit))?.val,
@@ -397,6 +413,8 @@
                     feuchteSensor: (await getStateAsync(roomConfig.devices.feuchteSensor))?.val,
                     wandSensorOberflaeche: (await getStateAsync(roomConfig.devices.wandSensorOberflaeche))?.val,
                     wandSensorKern: (await getStateAsync(roomConfig.devices.wandSensorKern))?.val,
+                    solarKorrekturId: (await getStateAsync(roomConfig.lernwerte.solarKorrekturId))?.val,
+                    windKorrekturId: (await getStateAsync(roomConfig.lernwerte.windKorrekturId))?.val,
                     fensterKontakte: []
                 };
 
@@ -404,7 +422,7 @@
                     states.fensterKontakte.push((await getStateAsync(subId))?.val);
                 }
 
-                // --- 3.1.2 Validierung ---
+                // --- 3.1.2 Sensoren validieren & Hilfsvariablen ---
                 const aussenSensorOK =
                     typeof states.aussenTempSensor === 'number' &&
                     states.aussenTempSensor > -30.0 &&
@@ -431,11 +449,12 @@
                     state => state === true || state === 1 || state === 'true' || state === '1'
                 );
 
+                // --- Log-Strings vorbereiten ---
                 let logModuleAction = '';
                 let logWetter = '';
                 let logPrognose = '';
 
-                // --- 3.1.3 Basistemperatur ---
+                // --- 3.1.3 LOGIK: Basistemperatur ermitteln ---
                 let neueSollTemp;
                 let istSonderfall = false;
 
@@ -459,7 +478,7 @@
 
                 const basisSollTemp = neueSollTemp;
 
-                // --- 3.1.4 Dynamische Anpassungen & Module ---
+                // --- 3.1.4 LOGIK: Dynamische Anpassungen & Module ---
                 if (!istSonderfall) {
 
                     // --- 3.1.4.1 Feuchtekorrektur ---
@@ -470,10 +489,6 @@
                     }
 
                     // --- 3.1.4.2 Wetter-Analyse (Solar/Wind) ---
-                    // GEAENDERT in V9.0: kein multiplikativer Korrekturfaktor mehr.
-                    // Solar/Wind wirken direkt mit dem vom wetter_analyse.js
-                    // gelieferten Faktor. Kontextabhaengige Feinjustierung uebernimmt
-                    // der Strategen-Offset in Schritt 3.1.4.4.
                     let maxSolarFaktor = 0;
                     let maxWindFaktor = 1.0;
 
@@ -489,16 +504,21 @@
                         }
                     }
 
+                    const gelernteSolarKorrektur =
+                        typeof states.solarKorrekturId === 'number' ? states.solarKorrekturId : 1.0;
+                    const gelernterWindKorrektur =
+                        typeof states.windKorrekturId === 'number' ? states.windKorrekturId : 1.0;
+
                     if (maxSolarFaktor > 0) {
                         const solarOffset = -1.0 * maxSolarFaktor;
-                        neueSollTemp += solarOffset;
-                        logWetter += `, Solar=${solarOffset.toFixed(2)} (F:${maxSolarFaktor.toFixed(2)})`;
+                        neueSollTemp += solarOffset * gelernteSolarKorrektur;
+                        logWetter += `, Solar=${(solarOffset * gelernteSolarKorrektur).toFixed(2)} (F:${maxSolarFaktor.toFixed(2)}*K:${gelernteSolarKorrektur.toFixed(2)})`;
                     }
 
                     if (maxWindFaktor > 1.0) {
                         const windOffset = 1.0 * (maxWindFaktor - 1.0);
-                        neueSollTemp += windOffset;
-                        logWetter += `, Wind=+${windOffset.toFixed(2)} (F:${maxWindFaktor.toFixed(2)})`;
+                        neueSollTemp += windOffset * gelernterWindKorrektur;
+                        logWetter += `, Wind=+${(windOffset * gelernterWindKorrektur).toFixed(2)} (F:${maxWindFaktor.toFixed(2)}*K:${gelernterWindKorrektur.toFixed(2)})`;
                     }
 
                     // --- 3.1.4.3 PHYSIK-MODULE & WETTERFUEHRUNG (Maximum-Prinzip) ---
@@ -518,7 +538,7 @@
                         typeof states.wandSensorOberflaeche === 'number' &&
                         states.wandSensorOberflaeche < 90.0;
 
-                    // Kandidat B: Schimmelschutz — Math.log10() (Bugfix Paket 1)
+                    // Kandidat B: Schimmelschutz — BUGFIX aus Paket 1: Math.log10() statt Math.log()
                     if (roomConfig.module.schimmelSchutzAktiv && feuchteSensorOK && wandSensorOberflaecheOK) {
                         const MAGNUS_A = 7.5;
                         const MAGNUS_B = 237.3;
@@ -564,6 +584,17 @@
                     neueSollTemp += roomConfig.temperaturOffset;
 
                     // --- 3.1.4.4 STRATEGEN-PROGNOSE (Paket 3) ---
+                    // Der Stratege schreibt periodisch (alle 15 Min) aus der SQL-Wissensbasis
+                    // einen empfohlenen Offset und ein Vertrauenslevel (nutzungs_zaehler).
+                    // Der Offset wird auf +/- PROGNOSE_OFFSET_CLIP begrenzt und linear
+                    // nach Vertrauen gewichtet bevor er addiert wird.
+                    //
+                    // Sicherheitsregeln:
+                    //   - prognose.aktiviert === false        -> komplett ignorieren
+                    //   - offsetId oder vertrauenId fehlen    -> komplett ignorieren
+                    //   - Wert nicht numerisch / null         -> Offset = 0
+                    //   - Vertrauen 0 oder nicht lesbar       -> Offset = 0
+                    //
                     if (roomConfig.prognose && roomConfig.prognose.aktiviert) {
                         const rawOffsetState = await getStateAsync(roomConfig.prognose.offsetId);
                         const rawVertrauenState = await getStateAsync(roomConfig.prognose.vertrauenId);
@@ -578,11 +609,13 @@
                                 : 0;
 
                         if (rawOffset !== null && rawVertrauen > 0) {
+                            // Clipping auf +/- PROGNOSE_OFFSET_CLIP (Schutz vor DB-Ausreissern)
                             const geklammerterOffset = Math.max(
                                 -PROGNOSE_OFFSET_CLIP,
                                 Math.min(PROGNOSE_OFFSET_CLIP, rawOffset)
                             );
 
+                            // Lineare Gewichtung nach Vertrauen
                             const vertrauensGewicht = Math.min(
                                 1.0,
                                 rawVertrauen / roomConfig.prognose.maxVertrauen
@@ -605,7 +638,7 @@
                     }
                 }
 
-                // --- 3.1.5 Finalisierung & Ausfuehrung ---
+                // --- 3.1.5 LOGIK: Finalisierung & Ausfuehrung ---
                 if (!istSonderfall) {
                     neueSollTemp = Math.max(
                         roomConfig.minSollTemp,
@@ -643,7 +676,11 @@
                             details.push(`TuerZu=${isDoorPhysicallyClosed}`);
                         }
                         details.push(`NachtSch=${!!states.nachtschaltung}`);
-                        if (istSonderfall) details.push(`SONDERFALL`);
+
+                        if (istSonderfall) {
+                            details.push(`SONDERFALL`);
+                        }
+
                         details.push(`Offset=${roomConfig.temperaturOffset}`);
                         details.push(`Mod1=${roomConfig.module.schimmelSchutzAktiv}`);
                         details.push(`Mod2=${roomConfig.module.behaglichkeitAktiv}`);
@@ -654,6 +691,7 @@
 
                         const logDetails = `(${details.join(', ')})`;
                         const logActions = `${logWetter}${logModuleAction}${logPrognose}`;
+
                         log(`${logMessage} ${logDetails}${logActions}`);
                     }
                 }
@@ -663,7 +701,7 @@
         }
 
         // =================================================================================
-        // 3.2 PRIORISIERTER DEBOUNCE-MANAGER
+        // 3.2 PRIORISIERTER DEBOUNCE-MANAGER (pro Raum-Instanz)
         // =================================================================================
         function triggerCalculation(isHighPriority) {
             if (!DEBOUNCE_CONFIG.aktiv) {
@@ -711,7 +749,7 @@
         }
 
         // =================================================================================
-        // 3.3 TRIGGER-REGISTRIERUNG
+        // 3.3 TRIGGER-REGISTRIERUNG (pro Raum-Instanz)
         // =================================================================================
 
         // --- High-Priority-Trigger ---
@@ -725,10 +763,11 @@
         on(highPriorityTriggerIds, () => triggerCalculation(true));
 
         // --- Low-Priority-Trigger ---
-        // ENTFERNT in V9.0: solarKorrekturId / windKorrekturId
         const lowPriorityTriggerIds = [
             GLOBAL_IDS.heizPeriode,
             GLOBAL_IDS.nachtschaltung,
+            roomConfig.lernwerte.solarKorrekturId,
+            roomConfig.lernwerte.windKorrekturId,
         ];
         for (const richtung of roomConfig.ausrichtungFenster) {
             lowPriorityTriggerIds.push(WETTER_PFADE.basisPfadSolar + richtung);
@@ -739,7 +778,10 @@
         );
         lowPriorityTriggerIds.push(...raumTempIds);
 
-        // --- Strategen-Prognose als Low-Priority-Trigger ---
+        // --- Strategen-Prognose als Low-Priority-Trigger (Paket 3) ---
+        // Nur registrieren wenn die Prognose fuer diesen Raum aktiviert ist.
+        // Ein neuer Offset oder ein geaendertes Vertrauen triggert den Raum
+        // mit 1 s Debounce-Delay — keine Spitzenlast beim HomeMatic-Bus.
         if (roomConfig.prognose && roomConfig.prognose.aktiviert) {
             if (roomConfig.prognose.offsetId) {
                 lowPriorityTriggerIds.push(roomConfig.prognose.offsetId);
@@ -768,12 +810,14 @@
 
         on(lowPriorityTriggerIds, handleLowPriorityTrigger);
 
+        // --- Erster Start (mit kleinem Versatz zum Abwarten der Trigger-Registrierung) ---
         setTimeout(() => triggerCalculation(true), 1500);
 
         if (DEBUG_LOG_AKTIV) {
             log(`[${roomConfig.roomName}] Raum-Controller initialisiert (dbRaum='${roomConfig.dbRaum}', Prognose=${!!(roomConfig.prognose && roomConfig.prognose.aktiviert)}).`, 'info');
         }
 
+        // --- Rueckgabe fuer zentrale Verwaltung ---
         return {
             main,
             triggerCalculation,
@@ -784,6 +828,10 @@
     // =====================================================================================
     // 4. INITIALISIERUNG: alle Raum-Instanzen erzeugen (mit 500 ms Versatz)
     // =====================================================================================
+    //
+    // Der Versatz dient ausschliesslich einem geordneten Start — nicht dem
+    // Duty-Cycle-Schutz. Den uebernimmt der Debounce-Manager jedes Raumes.
+    //
     const roomControllers = [];
 
     ROOMS_CONFIG.forEach((config, index) => {
@@ -794,8 +842,19 @@
     });
 
     // =====================================================================================
-    // 5. GEMEINSAMER SCHEDULE (alle 15 Minuten)
+    // 5. GEMEINSAMER SCHEDULE (alle 15 Minuten, loest alle Raeume aus)
     // =====================================================================================
+    //
+    // Ersetzt die 5 versetzten Cronjobs der Einzelskripte:
+    //   raum_bad.js         '1,16,31,46 * * * *'
+    //   raum_esszimmer.js   '2,17,32,47 * * * *'
+    //   raum_kueche.js      '3,18,33,48 * * * *'
+    //   raum_schlafzimmer.js '4,19,34,49 * * * *'
+    //   raum_wohnzimmer.js  '5,20,35,50 * * * *'
+    //
+    // Der Debounce-Manager verteilt Lastspitzen im Schreibzugriff auf HomeMatic
+    // — ein gemeinsamer Schedule ist damit sicher.
+    //
     schedule('*/15 * * * *', () => {
         roomControllers.forEach(controller => {
             if (controller && typeof controller.triggerCalculation === 'function') {
