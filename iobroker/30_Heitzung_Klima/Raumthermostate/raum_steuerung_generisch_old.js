@@ -6,8 +6,8 @@
    setStateAsync, setTimeout */
 
 /**
- * @fileoverview Generische Einzelraum-Heizungssteuerung fuer ioBroker (Paket 3)
- * @version 8.0 (Strategen-Anbindung ueber Prognose-Datenpunkte)
+ * @fileoverview Generische Einzelraum-Heizungssteuerung fuer ioBroker (Paket 2)
+ * @version 7.0 (Konsolidierung aus 5 Einzelskripten)
  * @author Sanweb
  * @license MIT
  *
@@ -22,22 +22,12 @@
  * eigenstaendige Instanz mit eigenem Closure, eigenem Debounce-Manager,
  * eigenen Triggern und eigener Haupt-Logik aufgebaut.
  *
- * NEU in V8.0 (Paket 3 — Strategen-Anbindung):
- * - Neues Konfigurationsfeld 'prognose' je Raum (offsetId, vertrauenId,
- *   maxVertrauen, aktiviert)
- * - Integration des Strategen-Offsets in die Solltemperaturberechnung:
- *   - Clipping auf +/- 2.0 Grad (Schutz vor DB-Ausreissern)
- *   - Lineare Gewichtung nach Vertrauen (nutzungs_zaehler / maxVertrauen)
- *   - Anwendung NACH den Physik-Modulen, VOR dem finalen min/max-Clipping
- * - Low-Priority-Trigger fuer Prognose-Datenpunkte (nur wenn aktiviert)
- * - Erweiterter Debug-Log mit Prognose-Details
- *
- * UEBERNOMMEN aus V7.0 (Paket 2):
+ * NEU in V7.0 (Paket 2):
  * - ROOMS_CONFIG-Array mit allen 5 Raeumen
  * - Fabrik-Funktion createRoomController() pro Raum
- * - Gemeinsamer Schedule (alle 15 Minuten)
- * - Gestaffelter Start (500 ms Versatz je Raum)
- * - Zweifeld-Struktur: roomName (Anzeige) + dbRaum (SQL-konform)
+ * - Ein gemeinsamer Schedule (alle 15 Minuten) statt 5 versetzte Cronjobs
+ * - Gestaffelter Start (500 ms Versatz je Raum) zur geordneten Initialisierung
+ * - Zweifeld-Struktur: roomName (Anzeige) + dbRaum (SQL-konform fuer Paket 3)
  *
  * UEBERNOMMENE BUGFIXES aus Paket 1:
  * - Magnus-Formel verwendet Math.log10() (korrekter dekadischer Logarithmus)
@@ -46,14 +36,8 @@
  *
  * ARCHITEKTUR-HINWEIS:
  * Die Raumskripte lesen ausschliesslich ioBroker-Datenpunkte aus dem RAM
- * und greifen NICHT direkt auf die SQL-Datenbank zu. Der Stratege
+ * und greifen NICHT direkt auf die SQL-Datenbank zu. Der Stratege (Paket 3)
  * uebernimmt die Rolle des Puffers zwischen SQL und Raumskripten.
- *
- * DATENFLUSS fuer den Prognose-Offset:
- *   SQL-Datenbank (iobroker_heizung.heizungs_erfahrung)
- *     -> Stratege (alle 15 Min, liest SQL, schreibt ioBroker-Datenpunkte)
- *     -> 0_userdata.0.Heizung.Prognose.{dbRaum}.Empfohlener_Offset(_Vertrauen)
- *     -> Raumskript (liest Datenpunkt bei Trigger, Clipping, Gewichtung)
  * -------------------------------------------------------------------------------------
  */
 
@@ -89,10 +73,6 @@
         luftfeuchteTriggerThreshold: 5.0,
     };
 
-    // Globale Grenze fuer den Prognose-Offset VOR der Vertrauensgewichtung.
-    // Schutz vor DB-Ausreissern (z.B. fehlerhaft gelernter Extremwert).
-    const PROGNOSE_OFFSET_CLIP = 2.0;
-
     const DEBUG_LOG_AKTIV = true;
 
     // =====================================================================================
@@ -103,16 +83,11 @@
     //   roomName  = Anzeige-Name (wie im Originalskript, fuer Logs)
     //   dbRaum    = SQL-konformer Schluessel (fuer Paket 3 / Stratege)
     //               Werte: Wohnzimmer, Schlafzimmer, Badezimmer, Kueche, Esszimmer
-    //   prognose  = Strategen-Anbindung (Paket 3):
-    //               offsetId      — Datenpunkt vom Strategen (Grad C)
-    //               vertrauenId   — Datenpunkt vom Strategen (nutzungs_zaehler)
-    //               maxVertrauen  — Schwelle fuer Vollvertrauen (50 = "reifer" Datensatz)
-    //               aktiviert     — pro Raum abschaltbar
     //
     const ROOMS_CONFIG = [
         // -----------------------------------------------------------------------------
         // RAUM 1: BAD
-        // Quelle: raum_bad.js (Paket 1, V6.15) -> generisches Skript V7.0 (Paket 2)
+        // Quelle: raum_bad.js (Paket 1, V6.15)
         // -----------------------------------------------------------------------------
         {
             roomName: 'Bad',
@@ -139,12 +114,6 @@
                 solarKorrekturId: '0_userdata.0.Heizung.Lernwerte.Badezimmer.Solar_Korrektur',
                 windKorrekturId: '0_userdata.0.Heizung.Lernwerte.Badezimmer.Wind_Korrektur',
             },
-            prognose: {
-                offsetId: '0_userdata.0.Heizung.Prognose.Badezimmer.Empfohlener_Offset',
-                vertrauenId: '0_userdata.0.Heizung.Prognose.Badezimmer.Empfohlener_Offset_Vertrauen',
-                maxVertrauen: 50,
-                aktiviert: true,
-            },
             basisRegelung: {
                 aussenTempNeutral: 12.0,
                 heizkurvenfaktor: 0.1,
@@ -165,7 +134,7 @@
 
         // -----------------------------------------------------------------------------
         // RAUM 2: ESSZIMMER
-        // Quelle: raum_esszimmer.js (Paket 1, V6.15) -> generisches Skript V7.0 (Paket 2)
+        // Quelle: raum_esszimmer.js (Paket 1, V6.15)
         // -----------------------------------------------------------------------------
         {
             roomName: 'Esszimmer',
@@ -192,12 +161,6 @@
                 solarKorrekturId: '0_userdata.0.Heizung.Lernwerte.Esszimmer.Solar_Korrektur',
                 windKorrekturId: '0_userdata.0.Heizung.Lernwerte.Esszimmer.Wind_Korrektur',
             },
-            prognose: {
-                offsetId: '0_userdata.0.Heizung.Prognose.Esszimmer.Empfohlener_Offset',
-                vertrauenId: '0_userdata.0.Heizung.Prognose.Esszimmer.Empfohlener_Offset_Vertrauen',
-                maxVertrauen: 50,
-                aktiviert: true,
-            },
             basisRegelung: {
                 aussenTempNeutral: 12.0,
                 heizkurvenfaktor: 0.1,
@@ -218,7 +181,7 @@
 
         // -----------------------------------------------------------------------------
         // RAUM 3: KUECHE
-        // Quelle: raum_kueche.js (Paket 1, V6.15) -> generisches Skript V7.0 (Paket 2)
+        // Quelle: raum_kueche.js (Paket 1, V6.15)
         // -----------------------------------------------------------------------------
         {
             roomName: 'Küche',
@@ -245,12 +208,6 @@
                 solarKorrekturId: '0_userdata.0.Heizung.Lernwerte.Kueche.Solar_Korrektur',
                 windKorrekturId: '0_userdata.0.Heizung.Lernwerte.Kueche.Wind_Korrektur',
             },
-            prognose: {
-                offsetId: '0_userdata.0.Heizung.Prognose.Kueche.Empfohlener_Offset',
-                vertrauenId: '0_userdata.0.Heizung.Prognose.Kueche.Empfohlener_Offset_Vertrauen',
-                maxVertrauen: 50,
-                aktiviert: true,
-            },
             basisRegelung: {
                 aussenTempNeutral: 12.0,
                 heizkurvenfaktor: 0.1,
@@ -271,7 +228,7 @@
 
         // -----------------------------------------------------------------------------
         // RAUM 4: SCHLAFZIMMER
-        // Quelle: raum_schlafzimmer.js (Paket 1, V6.15) -> generisches Skript V7.0 (Paket 2)
+        // Quelle: raum_schlafzimmer.js (Paket 1, V6.15)
         // -----------------------------------------------------------------------------
         {
             roomName: 'Schlafzimmer',
@@ -298,12 +255,6 @@
                 solarKorrekturId: '0_userdata.0.Heizung.Lernwerte.Schlafzimmer.Solar_Korrektur',
                 windKorrekturId: '0_userdata.0.Heizung.Lernwerte.Schlafzimmer.Wind_Korrektur',
             },
-            prognose: {
-                offsetId: '0_userdata.0.Heizung.Prognose.Schlafzimmer.Empfohlener_Offset',
-                vertrauenId: '0_userdata.0.Heizung.Prognose.Schlafzimmer.Empfohlener_Offset_Vertrauen',
-                maxVertrauen: 50,
-                aktiviert: true,
-            },
             basisRegelung: {
                 aussenTempNeutral: 12.0,
                 heizkurvenfaktor: 0.1,
@@ -324,7 +275,7 @@
 
         // -----------------------------------------------------------------------------
         // RAUM 5: WOHNZIMMER
-        // Quelle: raum_wohnzimmer.js (Paket 1, V6.15) -> generisches Skript V7.0 (Paket 2)
+        // Quelle: raum_wohnzimmer.js (Paket 1, V6.15)
         // -----------------------------------------------------------------------------
         {
             roomName: 'Wohnzimmer',
@@ -350,12 +301,6 @@
             lernwerte: {
                 solarKorrekturId: '0_userdata.0.Heizung.Lernwerte.Wohnzimmer.Solar_Korrektur',
                 windKorrekturId: '0_userdata.0.Heizung.Lernwerte.Wohnzimmer.Wind_Korrektur',
-            },
-            prognose: {
-                offsetId: '0_userdata.0.Heizung.Prognose.Wohnzimmer.Empfohlener_Offset',
-                vertrauenId: '0_userdata.0.Heizung.Prognose.Wohnzimmer.Empfohlener_Offset_Vertrauen',
-                maxVertrauen: 50,
-                aktiviert: true,
             },
             basisRegelung: {
                 aussenTempNeutral: 12.0,
@@ -452,7 +397,6 @@
                 // --- Log-Strings vorbereiten ---
                 let logModuleAction = '';
                 let logWetter = '';
-                let logPrognose = '';
 
                 // --- 3.1.3 LOGIK: Basistemperatur ermitteln ---
                 let neueSollTemp;
@@ -582,60 +526,6 @@
                     }
 
                     neueSollTemp += roomConfig.temperaturOffset;
-
-                    // --- 3.1.4.4 STRATEGEN-PROGNOSE (Paket 3) ---
-                    // Der Stratege schreibt periodisch (alle 15 Min) aus der SQL-Wissensbasis
-                    // einen empfohlenen Offset und ein Vertrauenslevel (nutzungs_zaehler).
-                    // Der Offset wird auf +/- PROGNOSE_OFFSET_CLIP begrenzt und linear
-                    // nach Vertrauen gewichtet bevor er addiert wird.
-                    //
-                    // Sicherheitsregeln:
-                    //   - prognose.aktiviert === false        -> komplett ignorieren
-                    //   - offsetId oder vertrauenId fehlen    -> komplett ignorieren
-                    //   - Wert nicht numerisch / null         -> Offset = 0
-                    //   - Vertrauen 0 oder nicht lesbar       -> Offset = 0
-                    //
-                    if (roomConfig.prognose && roomConfig.prognose.aktiviert) {
-                        const rawOffsetState = await getStateAsync(roomConfig.prognose.offsetId);
-                        const rawVertrauenState = await getStateAsync(roomConfig.prognose.vertrauenId);
-
-                        const rawOffset =
-                            rawOffsetState && typeof rawOffsetState.val === 'number'
-                                ? rawOffsetState.val
-                                : null;
-                        const rawVertrauen =
-                            rawVertrauenState && typeof rawVertrauenState.val === 'number'
-                                ? rawVertrauenState.val
-                                : 0;
-
-                        if (rawOffset !== null && rawVertrauen > 0) {
-                            // Clipping auf +/- PROGNOSE_OFFSET_CLIP (Schutz vor DB-Ausreissern)
-                            const geklammerterOffset = Math.max(
-                                -PROGNOSE_OFFSET_CLIP,
-                                Math.min(PROGNOSE_OFFSET_CLIP, rawOffset)
-                            );
-
-                            // Lineare Gewichtung nach Vertrauen
-                            const vertrauensGewicht = Math.min(
-                                1.0,
-                                rawVertrauen / roomConfig.prognose.maxVertrauen
-                            );
-                            const gewichteterOffset = geklammerterOffset * vertrauensGewicht;
-
-                            neueSollTemp += gewichteterOffset;
-
-                            logPrognose =
-                                `, Prognose=${gewichteterOffset >= 0 ? '+' : ''}${gewichteterOffset.toFixed(2)}` +
-                                ` (DB:${rawOffset >= 0 ? '+' : ''}${rawOffset.toFixed(2)}` +
-                                `, Clip:${geklammerterOffset >= 0 ? '+' : ''}${geklammerterOffset.toFixed(2)}` +
-                                `, Vtr:${rawVertrauen}/${roomConfig.prognose.maxVertrauen}` +
-                                `, Gew:${Math.round(vertrauensGewicht * 100)}%)`;
-                        } else {
-                            if (DEBUG_LOG_AKTIV) {
-                                logPrognose = `, Prognose=ignoriert (Offset=${rawOffset}, Vtr=${rawVertrauen})`;
-                            }
-                        }
-                    }
                 }
 
                 // --- 3.1.5 LOGIK: Finalisierung & Ausfuehrung ---
@@ -685,12 +575,9 @@
                         details.push(`Mod1=${roomConfig.module.schimmelSchutzAktiv}`);
                         details.push(`Mod2=${roomConfig.module.behaglichkeitAktiv}`);
                         details.push(`Mod3=${roomConfig.module.heizlastAktiv}`);
-                        if (roomConfig.prognose) {
-                            details.push(`Prog=${!!roomConfig.prognose.aktiviert}`);
-                        }
 
                         const logDetails = `(${details.join(', ')})`;
-                        const logActions = `${logWetter}${logModuleAction}${logPrognose}`;
+                        const logActions = `${logWetter}${logModuleAction}`;
 
                         log(`${logMessage} ${logDetails}${logActions}`);
                     }
@@ -778,19 +665,6 @@
         );
         lowPriorityTriggerIds.push(...raumTempIds);
 
-        // --- Strategen-Prognose als Low-Priority-Trigger (Paket 3) ---
-        // Nur registrieren wenn die Prognose fuer diesen Raum aktiviert ist.
-        // Ein neuer Offset oder ein geaendertes Vertrauen triggert den Raum
-        // mit 1 s Debounce-Delay — keine Spitzenlast beim HomeMatic-Bus.
-        if (roomConfig.prognose && roomConfig.prognose.aktiviert) {
-            if (roomConfig.prognose.offsetId) {
-                lowPriorityTriggerIds.push(roomConfig.prognose.offsetId);
-            }
-            if (roomConfig.prognose.vertrauenId) {
-                lowPriorityTriggerIds.push(roomConfig.prognose.vertrauenId);
-            }
-        }
-
         function handleLowPriorityTrigger(obj) {
             if (obj && obj.state && obj.oldState && obj.state.val === obj.oldState.val) return;
 
@@ -814,7 +688,7 @@
         setTimeout(() => triggerCalculation(true), 1500);
 
         if (DEBUG_LOG_AKTIV) {
-            log(`[${roomConfig.roomName}] Raum-Controller initialisiert (dbRaum='${roomConfig.dbRaum}', Prognose=${!!(roomConfig.prognose && roomConfig.prognose.aktiviert)}).`, 'info');
+            log(`[${roomConfig.roomName}] Raum-Controller initialisiert (dbRaum='${roomConfig.dbRaum}').`, 'info');
         }
 
         // --- Rueckgabe fuer zentrale Verwaltung ---
