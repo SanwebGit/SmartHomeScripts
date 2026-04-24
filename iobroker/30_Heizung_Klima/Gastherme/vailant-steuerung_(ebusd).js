@@ -123,7 +123,7 @@ const CONFIG = {
 // 2. HILFSFUNKTIONEN & INITIALISIERUNG
 // -------------------------------------------------------------------------------------
 
-function sysLog(msg, level = 'info') {
+function sysLog(msg, level = 'debug') {
     const levels = { debug: 0, info: 1, warn: 2, error: 3 };
     const confLvl = levels[CONFIG.logLevel] !== undefined ? levels[CONFIG.logLevel] : 1;
     const curLvl = levels[level] !== undefined ? levels[level] : 1;

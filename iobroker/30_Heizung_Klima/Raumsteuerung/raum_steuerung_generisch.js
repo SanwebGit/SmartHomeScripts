@@ -34,7 +34,7 @@
  * - Entfernt: solarKorrekturId / windKorrekturId aus lowPriorityTriggerIds
  * - Log-Format Solar/Wind ohne K-Faktor (z.B. "Solar=-0.50 (F:0.50)")
  *
- * NACH-MIGRATIONS-SCHRITT FUER ALEXANDER:
+ * NACH-MIGRATIONS-SCHRITT:
  *   Nach erfolgreichem Start von V9.0 koennen diese 10 Datenpunkte
  *   gefahrlos aus ioBroker geloescht werden:
  *     0_userdata.0.Heizung.Lernwerte.{Raum}.Solar_Korrektur
