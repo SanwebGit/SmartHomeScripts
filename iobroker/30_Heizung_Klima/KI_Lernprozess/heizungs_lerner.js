@@ -239,8 +239,8 @@
             const results = await Promise.all(promises);
             const historien = {};
             results.forEach((item) => {
-                const result = item.res;
-                historien[idMap[item.key]] = (result && result.result) || [];
+                // @ts-ignore — sendToAsync-Rueckgabetyp ist fuer InfluxDB-getHistory unterspezifiziert (hat zur Laufzeit ein .result-Array)
+                historien[idMap[item.key]] = (item.res && item.res.result) || [];
             });
             return historien;
         } catch (e) {
@@ -303,8 +303,8 @@
                     count: 500,
                 },
             });
-            const result = raw;
-            const punkte = (result && result.result) || [];
+            // @ts-ignore — sendToAsync-Rueckgabetyp ist fuer InfluxDB-getHistory unterspezifiziert (hat zur Laufzeit ein .result-Array)
+            const punkte = (raw && raw.result) || [];
 
             if (punkte.length === 0) {
                 log('[Sommerpause] Keine Aussentemperatur-Daten fuer 24h-Mittelwert gefunden.', 'warn');
