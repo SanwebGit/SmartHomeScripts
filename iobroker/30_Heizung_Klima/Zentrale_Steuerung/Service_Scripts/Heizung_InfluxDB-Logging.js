@@ -178,7 +178,7 @@ const datenpunkte = {
     '0_userdata.0.Heizung.Zentral.StatusTherme': booleanConfig,
     '0_userdata.0.Heizung.Zentral.HoechsteAnforderungTemp': setpointConfig,
     'mqtt.0.ebusd.700.Hc1HeatCurve.set': analysisConfig, // Loggt die an die Therme gesendete Heizkurve
-    'mqtt.1.ebusd.700.Z1DayTemp.set': setpointConfig, // Loggt die an die Therme gesendete Tagestemperatur
+    'mqtt.0.ebusd.700.Z1DayTemp.set': setpointConfig, // Loggt die an die Therme gesendete Tagestemperatur
 };
 
 
