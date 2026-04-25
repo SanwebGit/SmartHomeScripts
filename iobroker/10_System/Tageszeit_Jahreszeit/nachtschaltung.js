@@ -1,13 +1,34 @@
 /**
  * @file        Intelligente & träge Anwesenheitserkennung im Bett (ioBroker)
- * @version     3.4 ULTIMATE
+ * @version     4.0
  * @author      Sanweb
  * @description
- * Überarbeitete Version basierend auf Code-Analyse:
- * - Fix: Timer-Referenzierung über Objekt-Struktur.
- * - Performance: Parallele Zustandsabfragen via Promise.all.
- * - Robustheit: Try/Catch Error-Handling und Typ-Validierung.
- * - Flexibilität: Invertierbare Sensor-Logik und konfigurierbare Saisons.
+ * Refactoring v3.4 → v4.0:
+ *
+ * 🔴 KRITISCH:
+ *  - [1] Echter Queuing-Mutex für updateNightMode():
+ *        Trigger, die während eines laufenden Updates eintreffen, gehen nicht mehr
+ *        verloren. Stattdessen wird ein pendingNightModeUpdate-Flag gesetzt und
+ *        nach Abschluss des aktuellen Laufs einmalig nachgeholt. Damit ist der
+ *        zuletzt gemeldete Zustand garantiert ausgewertet worden.
+ *
+ * 🟡 MITTEL:
+ *  - [2] Sensor-Timer (links/rechts) werden bei Tag-/Abwesenheits-Reset jetzt
+ *        ebenfalls gestoppt — vermeidet, dass ein bereits laufender Frei-Timer
+ *        nach Rückkehr in den Nacht-/Anwesend-Modus unerwartet zuschlägt.
+ *  - [3] Null-Safety: isBelegtLinks / isBelegtRechts werden via !! sauber
+ *        auf Boolean gecastet. null/undefined ergibt nun deterministisch false.
+ *  - [4] DEBUG-Flag standardmäßig auf false (Produktion). Für Diagnose temporär
+ *        wieder auf true setzen.
+ *
+ * 🟢 OPTIONAL:
+ *  - [5] setStateChangedAndLog akzeptiert optional einen knownCurrentValue,
+ *        der einen redundanten getState-Call einspart, wenn der aktuelle Wert
+ *        ohnehin bereits vorliegt (z. B. innerhalb von updateNightMode).
+ *  - [6] SOMMER_MONATE: Begründung der Monatsauswahl als Kommentar ergänzt.
+ *
+ * Nicht geändert: Architektur (Trigger-Split, Timer-Objekt, Promise.all),
+ * Konfigurationsabschnitt, ioBroker-API-Aufrufe, Log-Präfix, Sprache.
  */
 
 // ======================================================================================
@@ -19,11 +40,11 @@ const SENSOR_LINKS_DP  = 'hm-rpc.0.001E1D899E94B0.1.STATE';
 const SENSOR_RECHTS_DP = 'hm-rpc.0.001E1D899E922D.1.STATE';
 
 /**
- * Sensor-Logik: 
- * false = Normal (false bedeutet belegt/geschlossen)
- * true  = Invertiert (true bedeutet belegt/geschlossen)
+ * Sensor-Logik:
+ * false = Normal      (false bedeutet belegt/geschlossen)
+ * true  = Invertiert  (true  bedeutet belegt/geschlossen)
  */
-const SENSOR_INVERTED = false; 
+const SENSOR_INVERTED = false;
 
 // --- 2. ZIEL-DATENPUNKTE IN IO-BROKER ---
 const STATUS_LINKS_VAR  = '0_userdata.0.System.Nachtschaltung.BettLinks';
@@ -32,7 +53,7 @@ const AKTIV_VAR         = '0_userdata.0.System.Nachtschaltung.Aktiv';
 
 // --- 3. STEUERNDE DATENPUNKTE ---
 const TAG_NACHT_VAR     = '0_userdata.0.System.Astro.Tag';
-const ANWESENHEIT_VAR   = '0_userdata.0.Anwesenheit.Status'; 
+const ANWESENHEIT_VAR   = '0_userdata.0.Anwesenheit.Status';
 
 // --- 4. VERZÖGERUNGSZEITEN & SAISON ---
 const DELAY_MINUTEN_SOMMER = 3;
@@ -41,18 +62,29 @@ const DELAY_MINUTEN_EINZEL = 30;
 
 const MS_PER_MINUTE = 60 * 1000; // Umrechnungsfaktor für Timer
 
-// Definition der Sommermonate (Juni bis September)
-const SOMMER_MONATE = [6, 7, 8, 9]; 
+/**
+ * Sommermonate: Juni–September.
+ * Begründung: In den vollen Sommermonaten ist die Nacht in Mitteleuropa kurz
+ * und die Aufwachphase typischerweise zügiger; daher reicht eine kürzere
+ * Frei-Verzögerung (DELAY_MINUTEN_SOMMER).
+ * Mai und Oktober gelten bewusst noch als "Winter" (= längere Verzögerung
+ * DELAY_MINUTEN_WINTER), weil dort die Übergangszeiten oft mit unruhigerem
+ * Schlafverhalten und längeren Wachphasen einhergehen.
+ * Wer ein anderes Verhalten möchte, passt einfach das Array an, z. B.:
+ *   [5, 6, 7, 8, 9, 10]  // Mai–Oktober als Sommer
+ */
+const SOMMER_MONATE = [6, 7, 8, 9];
 
 // --- 5. DEBUG-MODUS ---
-const DEBUG = true;
+// Für Produktion auf false. Für Diagnose temporär auf true setzen.
+const DEBUG = false;
 
 
 // ======================================================================================
 // │ GLOBALE VARIABLEN & ZUSTÄNDE                                                        │
 // └────────────────────────────────────────────────────────────────────────────────────┘
 
-const LOG_PREFIX = '[NACHTSCHALTUNG] '; 
+const LOG_PREFIX = '[NACHTSCHALTUNG] ';
 
 // Zentrale Timer-Verwaltung zur Vermeidung von Referenzfehlern
 const timers = {
@@ -61,8 +93,9 @@ const timers = {
     einzel: null
 };
 
-// Lock für Race-Condition-Vermeidung
-let isUpdatingNightMode = false;
+// Mutex + Queue-Flag für updateNightMode (Race-Condition-Schutz mit Nachholen)
+let isUpdatingNightMode    = false;
+let pendingNightModeUpdate = false;
 
 
 // ======================================================================================
@@ -102,10 +135,23 @@ function stopTimer(key) {
 
 /**
  * Setzt einen Datenpunkt nur dann, wenn sich der Wert geändert hat.
+ *
+ * @param {string} id  - Datenpunkt-ID
+ * @param {*}      value - zu setzender Wert
+ * @param {*}      [knownCurrentValue=undefined] - optional bereits bekannter
+ *                 aktueller Wert. Wenn übergeben (auch null/false), entfällt
+ *                 der zusätzliche getState-Call.
  */
-async function setStateChangedAndLog(id, value) {
-    const currentState = await safeGetState(id);
-    if (currentState.val !== value) {
+async function setStateChangedAndLog(id, value, knownCurrentValue = undefined) {
+    let currentVal;
+    if (typeof knownCurrentValue !== 'undefined') {
+        currentVal = knownCurrentValue;
+    } else {
+        const currentState = await safeGetState(id);
+        currentVal = currentState.val;
+    }
+
+    if (currentVal !== value) {
         if (DEBUG) log(`${LOG_PREFIX}AKTION: Setze '${id}' auf '${value}'.`);
         await setStateAsync(id, value, true);
     }
@@ -129,7 +175,7 @@ async function initializeDataPoints() {
             log(`${LOG_PREFIX}Erstelle Datenpunkt: ${id}`, 'info');
             await createStateAsync(id, {
                 type: 'boolean', // Hier direkt als Literal deklariert, was den Linter zufriedenstellt
-                name: config.name, 
+                name: config.name,
                 def: false, // default false für alle
                 read: true, write: true, role: config.role
             });
@@ -164,7 +210,7 @@ async function initializeDataPoints() {
  */
 async function processSensor(side, sensorRawValue) {
     const statusVar = side === 'links' ? STATUS_LINKS_VAR : STATUS_RECHTS_VAR;
-    
+
     // Logik-Umkehrung falls konfiguriert (Sicheres Casting mit !!)
     // Standard: false = belegt. Wenn Inverted=true, dann true = belegt.
     const isBelegt = SENSOR_INVERTED ? !!sensorRawValue : !sensorRawValue;
@@ -172,7 +218,7 @@ async function processSensor(side, sensorRawValue) {
     if (isBelegt) {
         // Falls ein Abwesenheits-Timer läuft: Stoppen (Person ist zurück)
         const wasRunning = stopTimer(side);
-        
+
         if (DEBUG) {
             if (wasRunning) {
                 log(`${LOG_PREFIX}INFO (${side.toUpperCase()}): Person vor Ablauf des Timers zurückgekehrt.`);
@@ -180,7 +226,7 @@ async function processSensor(side, sensorRawValue) {
                 log(`${LOG_PREFIX}INFO (${side.toUpperCase()}): Person hat sich ins Bett gelegt (kein laufender Timer).`);
             }
         }
-        
+
         await setStateChangedAndLog(statusVar, true);
     } else {
         // Person verlässt das Bett -> Prüfen ob vorher belegt war
@@ -204,14 +250,21 @@ async function processSensor(side, sensorRawValue) {
 
 /**
  * Zentrale Entscheidungs-Logik der Nachtschaltung.
+ *
+ * Mutex mit Queue: Läuft bereits eine Auswertung, wird der eingehende Trigger
+ * nicht verworfen, sondern als pending markiert und nach dem aktuellen Lauf
+ * einmalig nachgeholt. So ist garantiert, dass der jeweils zuletzt gemeldete
+ * Zustand auch tatsächlich ausgewertet wird.
  */
 async function updateNightMode() {
-    // Race-Condition Schutz
     if (isUpdatingNightMode) {
-        if (DEBUG) log(`${LOG_PREFIX}RACE-CONDITION SCHUTZ: updateNightMode läuft bereits, überspringe Trigger.`);
+        pendingNightModeUpdate = true;
+        if (DEBUG) log(`${LOG_PREFIX}QUEUE: updateNightMode läuft bereits, Trigger wird nachgeholt.`);
         return;
     }
-    isUpdatingNightMode = true;
+
+    isUpdatingNightMode    = true;
+    pendingNightModeUpdate = false;
 
     try {
         // Performance: Alle Zustände parallel abfragen
@@ -223,11 +276,12 @@ async function updateNightMode() {
             safeGetState(AKTIV_VAR)
         ]);
 
-        const isBelegtLinks  = links.val;
-        const isBelegtRechts = rechts.val;
-        const isNacht        = tagStatus.val === false; // Tag=true -> Nacht=false
+        // Null-Safety: undefined/null werden deterministisch zu false
+        const isBelegtLinks  = !!links.val;
+        const isBelegtRechts = !!rechts.val;
+        const isNacht        = tagStatus.val === false;   // Tag=true -> Nacht=false
         const isAnwesend     = anwesenheit.val === true;
-        const isAktivCurrent = aktiv.val === true; // Fallback: null/undefined wird false
+        const isAktivCurrent = aktiv.val === true;        // Fallback: null/undefined wird false
 
         if (DEBUG) {
             log(`${LOG_PREFIX}ANALYSE: Links=${isBelegtLinks} | Rechts=${isBelegtRechts} | Nacht=${isNacht} | Anwesend=${isAnwesend}`);
@@ -235,10 +289,13 @@ async function updateNightMode() {
 
         // MASTER-REGEL: Abbruch bei Tag oder Abwesenheit
         if (!isNacht || !isAnwesend) {
-            if (isAktivCurrent || timers.einzel) {
-                if (DEBUG) log(`${LOG_PREFIX}RESET: Tag oder Abwesenheit erkannt. Deaktiviere Schaltung.`);
+            if (isAktivCurrent || timers.einzel || timers.links || timers.rechts) {
+                if (DEBUG) log(`${LOG_PREFIX}RESET: Tag oder Abwesenheit erkannt. Deaktiviere Schaltung und stoppe alle Timer.`);
+                stopTimer('links');
+                stopTimer('rechts');
                 stopTimer('einzel');
-                await setStateChangedAndLog(AKTIV_VAR, false);
+                // Bekannten Wert direkt mitgeben -> spart einen getState-Call
+                await setStateChangedAndLog(AKTIV_VAR, false, isAktivCurrent);
             }
             return;
         }
@@ -250,15 +307,15 @@ async function updateNightMode() {
         if (beideBelegt) {
             // Sofort aktiv
             stopTimer('einzel');
-            await setStateChangedAndLog(AKTIV_VAR, true);
+            await setStateChangedAndLog(AKTIV_VAR, true, isAktivCurrent);
         } else if (einerBelegt) {
             // Verzögerte Aktivierung falls noch nicht aktiv
             if (!isAktivCurrent && !timers.einzel) {
                 const delayMs = DELAY_MINUTEN_EINZEL * MS_PER_MINUTE;
                 const ablauf = new Date(Date.now() + delayMs).toLocaleTimeString();
-                
+
                 if (DEBUG) log(`${LOG_PREFIX}LOGIK: Einzelperson erkannt. Aktiviere Nachtschaltung in ${DELAY_MINUTEN_EINZEL}min (um ${ablauf}).`);
-                
+
                 timers.einzel = setTimeout(async () => {
                     timers.einzel = null;
                     await setStateChangedAndLog(AKTIV_VAR, true);
@@ -267,11 +324,18 @@ async function updateNightMode() {
         } else {
             // Niemand im Bett
             stopTimer('einzel');
-            await setStateChangedAndLog(AKTIV_VAR, false);
+            await setStateChangedAndLog(AKTIV_VAR, false, isAktivCurrent);
         }
     } finally {
         // Lock zwingend freigeben
         isUpdatingNightMode = false;
+
+        // Falls während des Laufs ein weiterer Trigger eintraf: einmalig nachholen.
+        if (pendingNightModeUpdate) {
+            pendingNightModeUpdate = false;
+            if (DEBUG) log(`${LOG_PREFIX}QUEUE: Hole verworfenen Trigger nach.`);
+            await updateNightMode();
+        }
     }
 }
 
@@ -308,12 +372,12 @@ onStop(() => {
 (async function main() {
     log(`${LOG_PREFIX}Initialisierung...`, 'info');
     await initializeDataPoints();
-    
+
     // Cleanup möglicher alter Timer-Zustände beim Skript-Start
     stopTimer('links');
     stopTimer('rechts');
     stopTimer('einzel');
-    
+
     // Initialer Check beim Start
     await updateNightMode();
     log(`${LOG_PREFIX}System bereit.`, 'info');
