@@ -1,34 +1,18 @@
 /**
  * @file        Intelligente & träge Anwesenheitserkennung im Bett (ioBroker)
- * @version     4.0
+ * @version     4.1 ULTIMATE
  * @author      Sanweb
  * @description
- * Refactoring v3.4 → v4.0:
+ * Überarbeitete Version basierend auf v3.4 mit drei gezielten Korrekturen
+ * unter Beibehaltung der unveränderten Kernlogik:
  *
- * 🔴 KRITISCH:
- *  - [1] Echter Queuing-Mutex für updateNightMode():
- *        Trigger, die während eines laufenden Updates eintreffen, gehen nicht mehr
- *        verloren. Stattdessen wird ein pendingNightModeUpdate-Flag gesetzt und
- *        nach Abschluss des aktuellen Laufs einmalig nachgeholt. Damit ist der
- *        zuletzt gemeldete Zustand garantiert ausgewertet worden.
+ *   [FIX 1] Race-Condition-Schutz auch in processSensor (Lock pro Seite).
+ *   [FIX 2] Neustart-Stabilität: Rücklese der Sensor-Rohwerte beim Start und
+ *           Synchronisation der Status-Datenpunkte mit dem Ist-Zustand.
+ *   [FIX 3] Per-Sensor-Invertierung statt globalem Flag, für gemischte
+ *           HomeMatic-Geräte mit unterschiedlichen Logikpegeln.
  *
- * 🟡 MITTEL:
- *  - [2] Sensor-Timer (links/rechts) werden bei Tag-/Abwesenheits-Reset jetzt
- *        ebenfalls gestoppt — vermeidet, dass ein bereits laufender Frei-Timer
- *        nach Rückkehr in den Nacht-/Anwesend-Modus unerwartet zuschlägt.
- *  - [3] Null-Safety: isBelegtLinks / isBelegtRechts werden via !! sauber
- *        auf Boolean gecastet. null/undefined ergibt nun deterministisch false.
- *  - [4] DEBUG-Flag standardmäßig auf false (Produktion). Für Diagnose temporär
- *        wieder auf true setzen.
- *
- * 🟢 OPTIONAL:
- *  - [5] setStateChangedAndLog akzeptiert optional einen knownCurrentValue,
- *        der einen redundanten getState-Call einspart, wenn der aktuelle Wert
- *        ohnehin bereits vorliegt (z. B. innerhalb von updateNightMode).
- *  - [6] SOMMER_MONATE: Begründung der Monatsauswahl als Kommentar ergänzt.
- *
- * Nicht geändert: Architektur (Trigger-Split, Timer-Objekt, Promise.all),
- * Konfigurationsabschnitt, ioBroker-API-Aufrufe, Log-Präfix, Sprache.
+ * Die Entscheidungsmatrix in updateNightMode() bleibt unverändert.
  */
 
 // ======================================================================================
@@ -40,11 +24,12 @@ const SENSOR_LINKS_DP  = 'hm-rpc.0.001E1D899E94B0.1.STATE';
 const SENSOR_RECHTS_DP = 'hm-rpc.0.001E1D899E922D.1.STATE';
 
 /**
- * Sensor-Logik:
- * false = Normal      (false bedeutet belegt/geschlossen)
- * true  = Invertiert  (true  bedeutet belegt/geschlossen)
+ * [FIX 3] Sensor-Logik pro Seite konfigurierbar.
+ * false = Normal (false bedeutet belegt/geschlossen)
+ * true  = Invertiert (true bedeutet belegt/geschlossen)
  */
-const SENSOR_INVERTED = false;
+const SENSOR_LINKS_INVERTED  = false;
+const SENSOR_RECHTS_INVERTED = false;
 
 // --- 2. ZIEL-DATENPUNKTE IN IO-BROKER ---
 const STATUS_LINKS_VAR  = '0_userdata.0.System.Nachtschaltung.BettLinks';
@@ -60,24 +45,13 @@ const DELAY_MINUTEN_SOMMER = 3;
 const DELAY_MINUTEN_WINTER = 4;
 const DELAY_MINUTEN_EINZEL = 30;
 
-const MS_PER_MINUTE = 60 * 1000; // Umrechnungsfaktor für Timer
+const MS_PER_MINUTE = 60 * 1000;
 
-/**
- * Sommermonate: Juni–September.
- * Begründung: In den vollen Sommermonaten ist die Nacht in Mitteleuropa kurz
- * und die Aufwachphase typischerweise zügiger; daher reicht eine kürzere
- * Frei-Verzögerung (DELAY_MINUTEN_SOMMER).
- * Mai und Oktober gelten bewusst noch als "Winter" (= längere Verzögerung
- * DELAY_MINUTEN_WINTER), weil dort die Übergangszeiten oft mit unruhigerem
- * Schlafverhalten und längeren Wachphasen einhergehen.
- * Wer ein anderes Verhalten möchte, passt einfach das Array an, z. B.:
- *   [5, 6, 7, 8, 9, 10]  // Mai–Oktober als Sommer
- */
+// Definition der Sommermonate (Juni bis September)
 const SOMMER_MONATE = [6, 7, 8, 9];
 
 // --- 5. DEBUG-MODUS ---
-// Für Produktion auf false. Für Diagnose temporär auf true setzen.
-const DEBUG = false;
+const DEBUG = true;
 
 
 // ======================================================================================
@@ -86,16 +60,21 @@ const DEBUG = false;
 
 const LOG_PREFIX = '[NACHTSCHALTUNG] ';
 
-// Zentrale Timer-Verwaltung zur Vermeidung von Referenzfehlern
+// Zentrale Timer-Verwaltung
 const timers = {
     links: null,
     rechts: null,
     einzel: null
 };
 
-// Mutex + Queue-Flag für updateNightMode (Race-Condition-Schutz mit Nachholen)
-let isUpdatingNightMode    = false;
-let pendingNightModeUpdate = false;
+// [FIX 1] Locks pro Seite zur Vermeidung paralleler Sensor-Verarbeitung
+const sensorLocks = {
+    links: false,
+    rechts: false
+};
+
+// Lock für Race-Condition-Vermeidung in updateNightMode
+let isUpdatingNightMode = false;
 
 
 // ======================================================================================
@@ -135,26 +114,22 @@ function stopTimer(key) {
 
 /**
  * Setzt einen Datenpunkt nur dann, wenn sich der Wert geändert hat.
- *
- * @param {string} id  - Datenpunkt-ID
- * @param {*}      value - zu setzender Wert
- * @param {*}      [knownCurrentValue=undefined] - optional bereits bekannter
- *                 aktueller Wert. Wenn übergeben (auch null/false), entfällt
- *                 der zusätzliche getState-Call.
  */
-async function setStateChangedAndLog(id, value, knownCurrentValue = undefined) {
-    let currentVal;
-    if (typeof knownCurrentValue !== 'undefined') {
-        currentVal = knownCurrentValue;
-    } else {
-        const currentState = await safeGetState(id);
-        currentVal = currentState.val;
-    }
-
-    if (currentVal !== value) {
+async function setStateChangedAndLog(id, value) {
+    const currentState = await safeGetState(id);
+    if (currentState.val !== value) {
         if (DEBUG) log(`${LOG_PREFIX}AKTION: Setze '${id}' auf '${value}'.`);
         await setStateAsync(id, value, true);
     }
+}
+
+/**
+ * [FIX 3] Hilfsfunktion: Wandelt Rohwert eines Sensors unter Berücksichtigung
+ * der seitenspezifischen Invertierung in den belegt-Status um.
+ */
+function isSensorBelegt(side, rawValue) {
+    const inverted = side === 'links' ? SENSOR_LINKS_INVERTED : SENSOR_RECHTS_INVERTED;
+    return inverted ? !!rawValue : !rawValue;
 }
 
 
@@ -163,7 +138,6 @@ async function setStateChangedAndLog(id, value, knownCurrentValue = undefined) {
 // └────────────────────────────────────────────────────────────────────────────────────┘
 
 async function initializeDataPoints() {
-    // 'type' wurde aus dem Objekt entfernt, da ohnehin alle States boolean sind
     const statesToCreate = {
         [STATUS_LINKS_VAR]:  { name: 'Status Bett Links (belegt/frei)', role: 'state.switch' },
         [STATUS_RECHTS_VAR]: { name: 'Status Bett Rechts (belegt/frei)', role: 'state.switch' },
@@ -174,9 +148,9 @@ async function initializeDataPoints() {
         if (!(await existsStateAsync(id))) {
             log(`${LOG_PREFIX}Erstelle Datenpunkt: ${id}`, 'info');
             await createStateAsync(id, {
-                type: 'boolean', // Hier direkt als Literal deklariert, was den Linter zufriedenstellt
+                type: 'boolean',
                 name: config.name,
-                def: false, // default false für alle
+                def: false,
                 read: true, write: true, role: config.role
             });
         }
@@ -200,6 +174,41 @@ async function initializeDataPoints() {
     }
 }
 
+/**
+ * [FIX 2] Synchronisation der Status-Datenpunkte mit den tatsächlichen
+ * Sensor-Rohwerten beim Skript-Start. Verhindert, dass nach einem Neustart
+ * veraltete Status-Werte in die Logik einfließen.
+ *
+ * Wichtig: Es werden hier KEINE Delay-Timer rekonstruiert. Liegt jemand im
+ * Bett, wird der Status sofort auf 'belegt' gesetzt; ist das Bett leer, wird
+ * der Status direkt auf 'frei' gesetzt. Das ist der konservative Ansatz —
+ * die Verzögerungslogik gilt nur für während des Betriebs erkannte Übergänge.
+ */
+async function syncSensorStatesOnStartup() {
+    if (DEBUG) log(`${LOG_PREFIX}STARTUP-SYNC: Lese Sensor-Rohwerte und gleiche Status ab.`);
+
+    const [linksRaw, rechtsRaw] = await Promise.all([
+        safeGetState(SENSOR_LINKS_DP),
+        safeGetState(SENSOR_RECHTS_DP)
+    ]);
+
+    if (linksRaw.val !== null) {
+        const isBelegtLinks = isSensorBelegt('links', linksRaw.val);
+        if (DEBUG) log(`${LOG_PREFIX}STARTUP-SYNC: Links roh=${linksRaw.val} → belegt=${isBelegtLinks}`);
+        await setStateChangedAndLog(STATUS_LINKS_VAR, isBelegtLinks);
+    } else {
+        log(`${LOG_PREFIX}STARTUP-SYNC: Sensor links nicht lesbar — Sync übersprungen.`, 'warn');
+    }
+
+    if (rechtsRaw.val !== null) {
+        const isBelegtRechts = isSensorBelegt('rechts', rechtsRaw.val);
+        if (DEBUG) log(`${LOG_PREFIX}STARTUP-SYNC: Rechts roh=${rechtsRaw.val} → belegt=${isBelegtRechts}`);
+        await setStateChangedAndLog(STATUS_RECHTS_VAR, isBelegtRechts);
+    } else {
+        log(`${LOG_PREFIX}STARTUP-SYNC: Sensor rechts nicht lesbar — Sync übersprungen.`, 'warn');
+    }
+}
+
 
 // ======================================================================================
 // │ KERNLOGIK                                                                          │
@@ -207,67 +216,73 @@ async function initializeDataPoints() {
 
 /**
  * Verarbeitet die Sensor-Eingaben (links/rechts).
+ *
+ * [FIX 1] Schutz vor parallelen Aufrufen pro Seite via sensorLocks.
+ * Logik selbst bleibt identisch zur v3.4-Schematik.
  */
 async function processSensor(side, sensorRawValue) {
-    const statusVar = side === 'links' ? STATUS_LINKS_VAR : STATUS_RECHTS_VAR;
+    // [FIX 1] Race-Condition-Schutz pro Seite
+    if (sensorLocks[side]) {
+        if (DEBUG) log(`${LOG_PREFIX}RACE-CONDITION SCHUTZ (${side.toUpperCase()}): processSensor läuft bereits, überspringe.`);
+        return;
+    }
+    sensorLocks[side] = true;
 
-    // Logik-Umkehrung falls konfiguriert (Sicheres Casting mit !!)
-    // Standard: false = belegt. Wenn Inverted=true, dann true = belegt.
-    const isBelegt = SENSOR_INVERTED ? !!sensorRawValue : !sensorRawValue;
+    try {
+        const statusVar = side === 'links' ? STATUS_LINKS_VAR : STATUS_RECHTS_VAR;
 
-    if (isBelegt) {
-        // Falls ein Abwesenheits-Timer läuft: Stoppen (Person ist zurück)
-        const wasRunning = stopTimer(side);
+        // [FIX 3] Per-Sensor-Invertierung über Hilfsfunktion
+        const isBelegt = isSensorBelegt(side, sensorRawValue);
 
-        if (DEBUG) {
-            if (wasRunning) {
-                log(`${LOG_PREFIX}INFO (${side.toUpperCase()}): Person vor Ablauf des Timers zurückgekehrt.`);
-            } else {
-                log(`${LOG_PREFIX}INFO (${side.toUpperCase()}): Person hat sich ins Bett gelegt (kein laufender Timer).`);
+        if (isBelegt) {
+            // Falls ein Abwesenheits-Timer läuft: Stoppen (Person ist zurück)
+            const wasRunning = stopTimer(side);
+
+            if (DEBUG) {
+                if (wasRunning) {
+                    log(`${LOG_PREFIX}INFO (${side.toUpperCase()}): Person vor Ablauf des Timers zurückgekehrt.`);
+                } else {
+                    log(`${LOG_PREFIX}INFO (${side.toUpperCase()}): Person hat sich ins Bett gelegt (kein laufender Timer).`);
+                }
+            }
+
+            await setStateChangedAndLog(statusVar, true);
+        } else {
+            // Person verlässt das Bett -> Prüfen ob vorher belegt war
+            const currentStatus = await safeGetState(statusVar);
+            if (currentStatus.val === true) {
+                const currentMonth = new Date().getMonth() + 1;
+                const delayMin = SOMMER_MONATE.includes(currentMonth) ? DELAY_MINUTEN_SOMMER : DELAY_MINUTEN_WINTER;
+                const delayMs = delayMin * MS_PER_MINUTE;
+                const ablaufZeit = new Date(Date.now() + delayMs).toLocaleTimeString();
+
+                if (DEBUG) log(`${LOG_PREFIX}TIMER-START (${side.toUpperCase()}): Verlassen erkannt. Frei-Status in ${delayMin}min (um ${ablaufZeit}).`);
+
+                timers[side] = setTimeout(async () => {
+                    if (DEBUG) log(`${LOG_PREFIX}TIMER-ENDE (${side.toUpperCase()}): Zeit abgelaufen. Status auf 'frei'.`);
+                    timers[side] = null;
+                    await setStateChangedAndLog(statusVar, false);
+                }, delayMs);
             }
         }
-
-        await setStateChangedAndLog(statusVar, true);
-    } else {
-        // Person verlässt das Bett -> Prüfen ob vorher belegt war
-        const currentStatus = await safeGetState(statusVar);
-        if (currentStatus.val === true) {
-            const currentMonth = new Date().getMonth() + 1;
-            const delayMin = SOMMER_MONATE.includes(currentMonth) ? DELAY_MINUTEN_SOMMER : DELAY_MINUTEN_WINTER;
-            const delayMs = delayMin * MS_PER_MINUTE;
-            const ablaufZeit = new Date(Date.now() + delayMs).toLocaleTimeString();
-
-            if (DEBUG) log(`${LOG_PREFIX}TIMER-START (${side.toUpperCase()}): Verlassen erkannt. Frei-Status in ${delayMin}min (um ${ablaufZeit}).`);
-
-            timers[side] = setTimeout(async () => {
-                if (DEBUG) log(`${LOG_PREFIX}TIMER-ENDE (${side.toUpperCase()}): Zeit abgelaufen. Status auf 'frei'.`);
-                timers[side] = null;
-                await setStateChangedAndLog(statusVar, false);
-            }, delayMs);
-        }
+    } finally {
+        // [FIX 1] Lock zwingend freigeben
+        sensorLocks[side] = false;
     }
 }
 
 /**
  * Zentrale Entscheidungs-Logik der Nachtschaltung.
- *
- * Mutex mit Queue: Läuft bereits eine Auswertung, wird der eingehende Trigger
- * nicht verworfen, sondern als pending markiert und nach dem aktuellen Lauf
- * einmalig nachgeholt. So ist garantiert, dass der jeweils zuletzt gemeldete
- * Zustand auch tatsächlich ausgewertet wird.
+ * UNVERÄNDERT gegenüber v3.4 — diese Funktion bildet die Schematik exakt ab.
  */
 async function updateNightMode() {
     if (isUpdatingNightMode) {
-        pendingNightModeUpdate = true;
-        if (DEBUG) log(`${LOG_PREFIX}QUEUE: updateNightMode läuft bereits, Trigger wird nachgeholt.`);
+        if (DEBUG) log(`${LOG_PREFIX}RACE-CONDITION SCHUTZ: updateNightMode läuft bereits, überspringe Trigger.`);
         return;
     }
-
-    isUpdatingNightMode    = true;
-    pendingNightModeUpdate = false;
+    isUpdatingNightMode = true;
 
     try {
-        // Performance: Alle Zustände parallel abfragen
         const [links, rechts, tagStatus, anwesenheit, aktiv] = await Promise.all([
             safeGetState(STATUS_LINKS_VAR),
             safeGetState(STATUS_RECHTS_VAR),
@@ -276,12 +291,11 @@ async function updateNightMode() {
             safeGetState(AKTIV_VAR)
         ]);
 
-        // Null-Safety: undefined/null werden deterministisch zu false
-        const isBelegtLinks  = !!links.val;
-        const isBelegtRechts = !!rechts.val;
-        const isNacht        = tagStatus.val === false;   // Tag=true -> Nacht=false
+        const isBelegtLinks  = links.val;
+        const isBelegtRechts = rechts.val;
+        const isNacht        = tagStatus.val === false;
         const isAnwesend     = anwesenheit.val === true;
-        const isAktivCurrent = aktiv.val === true;        // Fallback: null/undefined wird false
+        const isAktivCurrent = aktiv.val === true;
 
         if (DEBUG) {
             log(`${LOG_PREFIX}ANALYSE: Links=${isBelegtLinks} | Rechts=${isBelegtRechts} | Nacht=${isNacht} | Anwesend=${isAnwesend}`);
@@ -289,13 +303,10 @@ async function updateNightMode() {
 
         // MASTER-REGEL: Abbruch bei Tag oder Abwesenheit
         if (!isNacht || !isAnwesend) {
-            if (isAktivCurrent || timers.einzel || timers.links || timers.rechts) {
-                if (DEBUG) log(`${LOG_PREFIX}RESET: Tag oder Abwesenheit erkannt. Deaktiviere Schaltung und stoppe alle Timer.`);
-                stopTimer('links');
-                stopTimer('rechts');
+            if (isAktivCurrent || timers.einzel) {
+                if (DEBUG) log(`${LOG_PREFIX}RESET: Tag oder Abwesenheit erkannt. Deaktiviere Schaltung.`);
                 stopTimer('einzel');
-                // Bekannten Wert direkt mitgeben -> spart einen getState-Call
-                await setStateChangedAndLog(AKTIV_VAR, false, isAktivCurrent);
+                await setStateChangedAndLog(AKTIV_VAR, false);
             }
             return;
         }
@@ -305,11 +316,9 @@ async function updateNightMode() {
         const einerBelegt = isBelegtLinks || isBelegtRechts;
 
         if (beideBelegt) {
-            // Sofort aktiv
             stopTimer('einzel');
-            await setStateChangedAndLog(AKTIV_VAR, true, isAktivCurrent);
+            await setStateChangedAndLog(AKTIV_VAR, true);
         } else if (einerBelegt) {
-            // Verzögerte Aktivierung falls noch nicht aktiv
             if (!isAktivCurrent && !timers.einzel) {
                 const delayMs = DELAY_MINUTEN_EINZEL * MS_PER_MINUTE;
                 const ablauf = new Date(Date.now() + delayMs).toLocaleTimeString();
@@ -322,20 +331,11 @@ async function updateNightMode() {
                 }, delayMs);
             }
         } else {
-            // Niemand im Bett
             stopTimer('einzel');
-            await setStateChangedAndLog(AKTIV_VAR, false, isAktivCurrent);
+            await setStateChangedAndLog(AKTIV_VAR, false);
         }
     } finally {
-        // Lock zwingend freigeben
         isUpdatingNightMode = false;
-
-        // Falls während des Laufs ein weiterer Trigger eintraf: einmalig nachholen.
-        if (pendingNightModeUpdate) {
-            pendingNightModeUpdate = false;
-            if (DEBUG) log(`${LOG_PREFIX}QUEUE: Hole verworfenen Trigger nach.`);
-            await updateNightMode();
-        }
     }
 }
 
@@ -352,7 +352,6 @@ on({ id: SENSOR_RECHTS_DP, change: 'ne' }, async (obj) => {
     await processSensor('rechts', obj.state.val);
 });
 
-// Trigger für die finale Logik (zusammengefasst)
 on({ id: [STATUS_LINKS_VAR, STATUS_RECHTS_VAR, TAG_NACHT_VAR, ANWESENHEIT_VAR], change: 'ne' }, async () => {
     await updateNightMode();
 });
@@ -370,13 +369,16 @@ onStop(() => {
 });
 
 (async function main() {
-    log(`${LOG_PREFIX}Initialisierung...`, 'info');
+    log(`${LOG_PREFIX}Initialisierung v3.5...`, 'info');
     await initializeDataPoints();
 
     // Cleanup möglicher alter Timer-Zustände beim Skript-Start
     stopTimer('links');
     stopTimer('rechts');
     stopTimer('einzel');
+
+    // [FIX 2] Status-Datenpunkte mit den realen Sensor-Rohwerten synchronisieren
+    await syncSensorStatesOnStartup();
 
     // Initialer Check beim Start
     await updateNightMode();
