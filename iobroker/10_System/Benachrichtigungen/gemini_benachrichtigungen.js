@@ -98,7 +98,7 @@ STRIKTE REGELN — halte sie ohne Ausnahme ein:
 - Erwähne NUR das angegebene Gerät. Erfinde nichts dazu.
 - ${tenseInstruction}
 - Maximal 1 Satz, maximal 12 Wörter.
-- Sprich den Nutzer passend zur Persona an (z. B. "Sir", "Du" o. Ä.).
+- Sprich den Nutzer passend an (z. B. "Hallo", "Guten Tag" o. Ä.).
 - Gib NUR den reinen Benachrichtigungstext aus — keine Anführungszeichen, keine Einleitungen, kein Kommentar.
 - Antworte ausschließlich auf Deutsch.
 
