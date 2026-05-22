@@ -23,7 +23,7 @@ const CONFIG = {
     states: {
         mailArrived: '0_userdata.0.briefkasten.post_war_da',
         inhabitantsInformed: '0_userdata.0.briefkasten.bewohner_informiert',
-        notificationText: '0_userdata.0.Gemini.Notification.Briefkasten'
+        notificationText: '0_userdata.0.Ollama.Notification.Briefkasten'
     },
     alexa: {
         speak: 'alexa2.0.Echo-Devices.G0911M10020400F5.Commands.speak',
