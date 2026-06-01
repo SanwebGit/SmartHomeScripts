@@ -1,738 +1,719 @@
 /**
  * =============================================================================
  * @file         stromzaehler.js
- * @description Skript zur Erfassung, Berechnung und Historisierung von 
+ * @description Skript zur Erfassung, Berechnung und Historisierung von
  * Stromverbrauchsdaten (Tages-, Wochen-, Monats- und Jahreswerte).
- * Liest Daten eines Zigbee-Sensors, erkennt Sensor-Resets und 
+ * Liest Daten eines Zigbee-Sensors, erkennt Sensor-Resets und
  * gleicht diese über einen dynamischen Offset automatisch ab.
- * @version      1.7.1 (Initial Run Zigbee-Offset Kompensation)
- * @date         2026-03-04
+ * Erweitert um Balkonkraftwerk-Integration: PV-Ertrag wird aus
+ * load_power (W) per Trapezintegration selbst akkumuliert.
+ * @version      1.9.0 (PV Eigenakkumulation aus load_power)
+ * @date         2026-06-02
  * @author       Sanweb
  * =============================================================================
- */
-
-/**
- * TypeScript Configuration Interface (optional, für IDEs)
- * @typedef {Object} Config
- * @property {string} basePath
- * @property {{energy: string, power: string}} sources
- * @property {number} maxZulaessigerSprungKwh
- * @property {number} minResetSchwelleKwh
- * @property {boolean} debug
- * @property {boolean} metrikSpeichern
- * @property {number} metrikUpdateIntervall
- */
-
-/**
- * =========================================================================
- * KONFIGURATION
- * =========================================================================
  */
 
 (function() {
     "use strict";
 
 const CONFIG = {
-    // Basis-Pfad unterhalb von 0_userdata.0, wo die neuen Punkte erstellt werden
     basePath: '0_userdata.0.Haushalt.Strom.',
-    
-    // Quell-Datenpunkte (z.B. Zigbee-Geräte)
+
+    // Haushaltszähler
     sources: {
-        energy: 'zigbee2mqtt.0.0x0015bc001b10168f.energy',      // Kumulierter Verbrauch in kWh
-        power:  'zigbee2mqtt.0.0x0015bc001b10168f.load_power'   // Aktuelle Leistung in W
+        energy: 'zigbee2mqtt.0.0x0015bc001b10168f.energy',
+        power:  'zigbee2mqtt.0.0x0015bc001b10168f.load_power'
     },
-    
 
-    // Schwellwerte für die Validierung
-    maxZulaessigerSprungKwh: 5.0, // Schützt vor utopischen Messfehlern
-    minResetSchwelleKwh: 0.01,    // Ignoriert minimale Fluktuationen beim Reset-Check
+    // Balkonkraftwerk — einzige Quelle: Momentanleistung in Watt
+    pv: {
+        power: 'zigbee2mqtt.0.0xa4c1380557aaffff.load_power'
+    },
 
-    // Metriken & Speicherschonung (I/O Reduzierung)
-    metrikSpeichern: true,
-    metrikUpdateIntervall: 10,    // Speichert Metriken nur bei jedem 10. Update in die DB (0 = nur bei Timer/Fehler)
+    // Schwellwerte Hauptzähler-Validierung
+    maxZulaessigerSprungKwh: 5.0,
+    minResetSchwelleKwh:     0.01,
 
-    // Erweitertes Debug-Logging für die Fehlersuche
-    debug: false 
+    // Metriken
+    metrikSpeichern:         true,
+    metrikUpdateIntervall:   10,
+
+    debug: false
 };
 
-/**
- * Definition der benötigten Datenpunkte
- */
+// ---------------------------------------------------------------------------
+// DATENPUNKTE
+// ---------------------------------------------------------------------------
 const DATENPUNKTE = [
-    { id: "Strom_Aktualisierung", name: "Strom Aktualisierung", type: "string", role: "text", unit: "", def: "YYYY-MM-DD 00:00:00" },
-    { id: "Strom_Referenz_Ablesung", name: "Strom Referenz Ablesung", type: "number", role: "value.energy", unit: "kWh" },
-    { id: "Strom_Referenz_heute", name: "Strom Referenz heute", type: "number", role: "value.energy", unit: "kWh" },
-    { id: "Strom_Referenz_Kalenderjahr", name: "Strom Referenz Kalenderjahr", type: "number", role: "value.energy", unit: "kWh" },
-    { id: "Strom_Referenz_Monat", name: "Strom Referenz Monat", type: "number", role: "value.energy", unit: "kWh" },
-    { id: "Strom_Referenz_Woche", name: "Strom Referenz Woche", type: "number", role: "value.energy", unit: "kWh" },
-    { id: "Strom_Verbrauch_aktuell", name: "Strom Verbrauch aktuell", type: "number", role: "value.power", unit: "W" },
-    { id: "Strom_Verbrauch_gestern", name: "Strom Verbrauch gestern", type: "number", role: "value.energy", unit: "kWh" },
-    { id: "Strom_Verbrauch_heute", name: "Strom Verbrauch heute", type: "number", role: "value.energy", unit: "kWh" },
-    { id: "Strom_Verbrauch_Kalenderjahr", name: "Strom Verbrauch Kalenderjahr", type: "number", role: "value.energy", unit: "kWh" },
-    { id: "Strom_Verbrauch_letzte_Ablesung", name: "Strom Verbrauch letzte Ablesung", type: "number", role: "value.energy", unit: "kWh" },
-    { id: "Strom_Verbrauch_letzter_Monat", name: "Strom Verbrauch letzter Monat", type: "number", role: "value.energy", unit: "kWh" },
-    { id: "Strom_Verbrauch_letztes_Kalenderjahr", name: "Strom Verbrauch letztes Kalenderjahr", type: "number", role: "value.energy", unit: "kWh" },
-    { id: "Strom_Verbrauch_letzte_Woche", name: "Strom Verbrauch letzte Woche", type: "number", role: "value.energy", unit: "kWh" },
-    { id: "Strom_Verbrauch_Monat", name: "Strom Verbrauch Monat", type: "number", role: "value.energy", unit: "kWh" },
-    { id: "Strom_Verbrauch_Woche", name: "Strom Verbrauch Woche", type: "number", role: "value.energy", unit: "kWh" },
-    { id: "Strom_Zaehlerstand", name: "Strom: Aktueller Zählerstand (Live)", desc: "Berechneter aktueller Zählerstand (Fester Startwert + gemessener Verbrauch)", type: "number", role: "value.energy", unit: "kWh" },
-    { id: "Strom_Geraete_Offset", name: "Strom Geräte Offset", type: "number", role: "value.energy", unit: "kWh" },
-    { id: "Strom_Letzter_Rohwert", name: "Strom Letzter Rohwert", type: "number", role: "value.energy", unit: "kWh" },
-    { id: "Strom_Ablesung_Trigger", name: "Strom Ablesung auslösen", type: "boolean", role: "button", unit: "", def: false },
-    { id: "Strom_Datum_letzte_Ablesung", name: "Strom Datum letzte Ablesung", type: "string", role: "text", unit: "", def: "" },
-    { id: "Strom_Letztes_Speicher_Datum", name: "Strom Letztes Speicher Datum", type: "string", role: "text", unit: "", def: "" },
-    { id: "Strom_Datum_Batterietausch", name: "Strom Datum Batterietausch", type: "string", role: "text", unit: "", def: "" },
-    
-    // NEU: Datenpunkte für den Zählerwechsel
-    { id: "Strom_Zaehler_Startoffset", name: "Zählerwechsel: Fester Startwert (Basis)", desc: "Physischer Zählerstand bei Erstinstallation oder Zählerwechsel. Ändert sich nicht automatisch.", type: "number", role: "value.energy", unit: "kWh", def: 9863 },
-    { id: "Strom_Zaehlerwechsel_Neuer_Wert", name: "Zählerwechsel: Neuer Zählerstand", type: "number", role: "value.energy", unit: "kWh", def: 0 },
-    { id: "Strom_Zaehlerwechsel_Trigger", name: "Zählerwechsel: Auslösen", type: "boolean", role: "button", unit: "", def: false },
+    // Haushalt — Bestand
+    { id: "Strom_Aktualisierung",                 name: "Strom Aktualisierung",                    type: "string",  role: "text",         unit: "",    def: "YYYY-MM-DD 00:00:00" },
+    { id: "Strom_Referenz_Ablesung",              name: "Strom Referenz Ablesung",                 type: "number",  role: "value.energy", unit: "kWh" },
+    { id: "Strom_Referenz_heute",                 name: "Strom Referenz heute",                    type: "number",  role: "value.energy", unit: "kWh" },
+    { id: "Strom_Referenz_Kalenderjahr",          name: "Strom Referenz Kalenderjahr",             type: "number",  role: "value.energy", unit: "kWh" },
+    { id: "Strom_Referenz_Monat",                 name: "Strom Referenz Monat",                    type: "number",  role: "value.energy", unit: "kWh" },
+    { id: "Strom_Referenz_Woche",                 name: "Strom Referenz Woche",                    type: "number",  role: "value.energy", unit: "kWh" },
+    { id: "Strom_Verbrauch_aktuell",              name: "Strom Verbrauch aktuell (Brutto)",         type: "number",  role: "value.power",  unit: "W"   },
+    { id: "Strom_Verbrauch_gestern",              name: "Strom Verbrauch gestern",                 type: "number",  role: "value.energy", unit: "kWh" },
+    { id: "Strom_Verbrauch_heute",                name: "Strom Verbrauch heute",                   type: "number",  role: "value.energy", unit: "kWh" },
+    { id: "Strom_Verbrauch_Kalenderjahr",         name: "Strom Verbrauch Kalenderjahr",            type: "number",  role: "value.energy", unit: "kWh" },
+    { id: "Strom_Verbrauch_letzte_Ablesung",      name: "Strom Verbrauch letzte Ablesung",         type: "number",  role: "value.energy", unit: "kWh" },
+    { id: "Strom_Verbrauch_letzter_Monat",        name: "Strom Verbrauch letzter Monat",           type: "number",  role: "value.energy", unit: "kWh" },
+    { id: "Strom_Verbrauch_letztes_Kalenderjahr", name: "Strom Verbrauch letztes Kalenderjahr",    type: "number",  role: "value.energy", unit: "kWh" },
+    { id: "Strom_Verbrauch_letzte_Woche",         name: "Strom Verbrauch letzte Woche",            type: "number",  role: "value.energy", unit: "kWh" },
+    { id: "Strom_Verbrauch_Monat",                name: "Strom Verbrauch Monat",                   type: "number",  role: "value.energy", unit: "kWh" },
+    { id: "Strom_Verbrauch_Woche",                name: "Strom Verbrauch Woche",                   type: "number",  role: "value.energy", unit: "kWh" },
+    { id: "Strom_Zaehlerstand",                   name: "Strom: Aktueller Zählerstand (Live)",     type: "number",  role: "value.energy", unit: "kWh" },
+    { id: "Strom_Geraete_Offset",                 name: "Strom Geräte Offset",                     type: "number",  role: "value.energy", unit: "kWh" },
+    { id: "Strom_Letzter_Rohwert",                name: "Strom Letzter Rohwert",                   type: "number",  role: "value.energy", unit: "kWh" },
+    { id: "Strom_Ablesung_Trigger",               name: "Strom Ablesung auslösen",                 type: "boolean", role: "button",       unit: "",    def: false },
+    { id: "Strom_Datum_letzte_Ablesung",          name: "Strom Datum letzte Ablesung",             type: "string",  role: "text",         unit: "",    def: "" },
+    { id: "Strom_Letztes_Speicher_Datum",         name: "Strom Letztes Speicher Datum",            type: "string",  role: "text",         unit: "",    def: "" },
+    { id: "Strom_Datum_Batterietausch",           name: "Strom Datum Batterietausch",              type: "string",  role: "text",         unit: "",    def: "" },
+    { id: "Strom_Zaehler_Startoffset",            name: "Zählerwechsel: Fester Startwert (Basis)", type: "number",  role: "value.energy", unit: "kWh", def: 9863 },
+    { id: "Strom_Zaehlerwechsel_Neuer_Wert",      name: "Zählerwechsel: Neuer Zählerstand",        type: "number",  role: "value.energy", unit: "kWh", def: 0 },
+    { id: "Strom_Zaehlerwechsel_Trigger",         name: "Zählerwechsel: Auslösen",                 type: "boolean", role: "button",       unit: "",    def: false },
 
-    // Exportierte Health-Check & Monitoring Metriken
-    { id: "Strom_Metriken_Updates_verarbeitet", name: "Metriken: Updates verarbeitet", type: "number", role: "value", unit: "", def: 0 },
-    { id: "Strom_Metriken_Letztes_Update", name: "Metriken: Letztes Update", type: "string", role: "text", unit: "", def: "" },
-    { id: "Strom_Metriken_Fehleranzahl", name: "Metriken: Fehleranzahl", type: "number", role: "value", unit: "", def: 0 },
-    { id: "Strom_Metriken_Resets_erkannt", name: "Metriken: Resets erkannt", type: "number", role: "value", unit: "", def: 0 },
-    { id: "Strom_Metriken_Letzter_Fehler", name: "Metriken: Letzter Fehler", type: "string", role: "text", unit: "", def: "" }
+    // PV — Momentanleistung (Rohwert vom Sensor)
+    { id: "PV_Leistung_aktuell",                  name: "PV Leistung aktuell",                     type: "number",  role: "value.power",  unit: "W"   },
+
+    // PV — eigenakkumulierte Ertragswerte (kWh)
+    { id: "PV_Ertrag_heute",                      name: "PV Ertrag heute",                         type: "number",  role: "value.energy", unit: "kWh" },
+    { id: "PV_Ertrag_gestern",                    name: "PV Ertrag gestern",                       type: "number",  role: "value.energy", unit: "kWh" },
+    { id: "PV_Ertrag_Woche",                      name: "PV Ertrag Woche",                         type: "number",  role: "value.energy", unit: "kWh" },
+    { id: "PV_Ertrag_letzte_Woche",               name: "PV Ertrag letzte Woche",                  type: "number",  role: "value.energy", unit: "kWh" },
+    { id: "PV_Ertrag_Monat",                      name: "PV Ertrag Monat",                         type: "number",  role: "value.energy", unit: "kWh" },
+    { id: "PV_Ertrag_letzter_Monat",              name: "PV Ertrag letzter Monat",                 type: "number",  role: "value.energy", unit: "kWh" },
+    { id: "PV_Ertrag_Kalenderjahr",               name: "PV Ertrag Kalenderjahr",                  type: "number",  role: "value.energy", unit: "kWh" },
+    { id: "PV_Ertrag_letztes_Kalenderjahr",       name: "PV Ertrag letztes Kalenderjahr",          type: "number",  role: "value.energy", unit: "kWh" },
+    // Interner Hilfswert: Zeitstempel des letzten PV-Watt-Wertes (Unix ms)
+    { id: "PV_Letzter_Timestamp",                 name: "PV Letzter Timestamp (intern)",           type: "number",  role: "value",        unit: "",    def: 0 },
+    // Interner Hilfswert: Letzter PV-Wattwert für Trapezintegration
+    { id: "PV_Letzter_Wattwert",                  name: "PV Letzter Wattwert (intern)",            type: "number",  role: "value.power",  unit: "W",   def: 0 },
+
+    // Netto-Bezug (Haushalt − PV)
+    { id: "Strom_Netto_Leistung",                 name: "Strom Netto-Bezug aktuell",               type: "number",  role: "value.power",  unit: "W",   desc: "Netzbezug nach PV-Abzug. Negativ = Einspeisung." },
+    { id: "Strom_Netto_Verbrauch_heute",          name: "Strom Netto-Bezug heute",                 type: "number",  role: "value.energy", unit: "kWh" },
+    { id: "Strom_Netto_Verbrauch_gestern",        name: "Strom Netto-Bezug gestern",               type: "number",  role: "value.energy", unit: "kWh" },
+    { id: "Strom_Netto_Verbrauch_Woche",          name: "Strom Netto-Bezug Woche",                 type: "number",  role: "value.energy", unit: "kWh" },
+    { id: "Strom_Netto_Verbrauch_Monat",          name: "Strom Netto-Bezug Monat",                 type: "number",  role: "value.energy", unit: "kWh" },
+    { id: "Strom_Netto_Verbrauch_Kalenderjahr",   name: "Strom Netto-Bezug Kalenderjahr",          type: "number",  role: "value.energy", unit: "kWh" },
+
+    // Metriken — Bestand
+    { id: "Strom_Metriken_Updates_verarbeitet",   name: "Metriken: Updates verarbeitet",           type: "number",  role: "value",        unit: "",    def: 0 },
+    { id: "Strom_Metriken_Letztes_Update",        name: "Metriken: Letztes Update",                type: "string",  role: "text",         unit: "",    def: "" },
+    { id: "Strom_Metriken_Fehleranzahl",          name: "Metriken: Fehleranzahl",                  type: "number",  role: "value",        unit: "",    def: 0 },
+    { id: "Strom_Metriken_Resets_erkannt",        name: "Metriken: Resets erkannt",                type: "number",  role: "value",        unit: "",    def: 0 },
+    { id: "Strom_Metriken_Letzter_Fehler",        name: "Metriken: Letzter Fehler",                type: "string",  role: "text",         unit: "",    def: "" }
 ];
 
-/**
- * =========================================================================
- * UTILS (Ausgelagerte Hilfsfunktionen)
- * =========================================================================
- */
+// ---------------------------------------------------------------------------
+// UTILS
+// ---------------------------------------------------------------------------
 const Utils = {
-    rundenKwh: (wert) => Number(Math.round(parseFloat(wert + 'e' + 3)) + 'e-' + 3),
-    
+    rundenKwh: (wert) => Number(Math.round(parseFloat(wert + 'e3')) + 'e-3'),
+
     formatiereDatum: (date) => {
-        const yyyy = date.getFullYear();
-        const mm = String(date.getMonth() + 1).padStart(2, '0');
-        const dd = String(date.getDate()).padStart(2, '0');
-        const hh = String(date.getHours()).padStart(2, '0');
-        const min = String(date.getMinutes()).padStart(2, '0');
-        const ss = String(date.getSeconds()).padStart(2, '0');
-        return `${yyyy}-${mm}-${dd} ${hh}:${min}:${ss}`;
+        const p = (n) => String(n).padStart(2, '0');
+        return `${date.getFullYear()}-${p(date.getMonth()+1)}-${p(date.getDate())} ${p(date.getHours())}:${p(date.getMinutes())}:${p(date.getSeconds())}`;
     },
 
     heuteIso: () => new Date().toISOString().split('T')[0],
 
-    getIsoWeek: (dateObj) => {
-        const d = new Date(Date.UTC(dateObj.getFullYear(), dateObj.getMonth(), dateObj.getDate()));
-        const dayNum = d.getUTCDay() || 7;
-        d.setUTCDate(d.getUTCDate() + 4 - dayNum);
-        const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
-        return Math.ceil((((d.getTime() - yearStart.getTime()) / 86400000) + 1) / 7);
+    getIsoWeek: (d) => {
+        const dt = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+        const day = dt.getUTCDay() || 7;
+        dt.setUTCDate(dt.getUTCDate() + 4 - day);
+        const yearStart = new Date(Date.UTC(dt.getUTCFullYear(), 0, 1));
+        return Math.ceil((((dt - yearStart) / 86400000) + 1) / 7);
     }
 };
 
-/**
- * =========================================================================
- * HAUPTKLASSE
- * =========================================================================
- */
+// ---------------------------------------------------------------------------
+// HAUPTKLASSE
+// ---------------------------------------------------------------------------
 class StromZaehlerManager {
     constructor(config, datenpunkte) {
-        this.config = config;
+        this.config      = config;
         this.datenpunkte = datenpunkte;
         this.subscriptions = [];
-        
-        // Zustandsverwaltung Reset-Erkennung
+
         this.pendingResetVerdacht = false;
-        this.pendingResetTimer = null;
-        
-        // Mutex Lock zur Vermeidung von Race Conditions
-        this.processingLock = false;
+        this.pendingResetTimer    = null;
+        this.processingLock       = false;
 
-        // Health-Check und Metriken
-        this.metrics = {
-            updatesProcessed: 0,
-            lastUpdateTime: "",
-            errors: 0,
-            resetsDetected: 0
-        };
+        this.metrics = { updatesProcessed: 0, lastUpdateTime: "", errors: 0, resetsDetected: 0 };
 
-        // 1. Cache für häufige State-Zugriffe
-        this.stateCache = new Map();
-        this.cacheTTL = 5000; // 5 Sekunden
+        this.stateCache  = new Map();
+        this.cacheTTL    = 5000;
 
-        // 2. Update-Queue für Burst-Situationen
-        this.updateQueue = [];
+        this.updateQueue  = [];
         this.batchTimeout = null;
 
-        // 3. & 4. Erweiterte Plausibilitätsprüfung & Systematische Fehler
         this.letzterPlausiblerZaehlerstand = null;
-        this.systematischeAbweichung = 0; // Hook für zukünftige Kalibrierungen
     }
 
+    // -------------------------------------------------------------------------
+    // START
+    // -------------------------------------------------------------------------
     async start() {
         try {
             log("Starte Initialisierung des Stromzählers...", "info");
-            
             this.validiereConfig();
             await this.erstelleDatenpunkte();
             await this.ladeMetriken();
-            
             await this.pruefeVerpassteWechsel();
             this.registriereTrigger();
             this.registriereCronjobs();
-            
             await this.fuehreInitialRunAus();
-
-            log("Stromzähler-Skript erfolgreich gestartet.", "info");
-        } catch (error) {
-            log(`Kritischer Fehler beim Starten des Skripts: ${error.message}`, "error");
+            log("Stromzähler-Skript (inkl. PV-Eigenakkumulation) erfolgreich gestartet.", "info");
+        } catch (e) {
+            log(`Kritischer Fehler beim Starten: ${e.message}`, "error");
         }
     }
 
+    // -------------------------------------------------------------------------
+    // VALIDIERUNG
+    // -------------------------------------------------------------------------
     validiereConfig() {
-        if (!this.config.basePath.endsWith('.')) throw new Error("Konfigurationsfehler: basePath muss mit einem Punkt '.' enden.");
-        if (this.config.maxZulaessigerSprungKwh <= 0) throw new Error("Konfigurationsfehler: maxZulaessigerSprungKwh muss > 0 sein.");
-        if (!existsState(this.config.sources.energy)) throw new Error(`Quell-Datenpunkt für Energy (${this.config.sources.energy}) existiert nicht! Abbruch.`);
-        if (!existsState(this.config.sources.power)) throw new Error(`Quell-Datenpunkt für Power (${this.config.sources.power}) existiert nicht! Abbruch.`);
+        if (!this.config.basePath.endsWith('.'))
+            throw new Error("basePath muss mit '.' enden.");
+        if (!existsState(this.config.sources.energy))
+            throw new Error(`Energy-Datenpunkt nicht gefunden: ${this.config.sources.energy}`);
+        if (!existsState(this.config.sources.power))
+            throw new Error(`Power-Datenpunkt nicht gefunden: ${this.config.sources.power}`);
+        if (!existsState(this.config.pv.power))
+            log(`WARNUNG: PV-Datenpunkt nicht gefunden: ${this.config.pv.power}`, "warn");
     }
 
+    // -------------------------------------------------------------------------
+    // DATENPUNKTE ERSTELLEN
+    // -------------------------------------------------------------------------
     async erstelleDatenpunkte() {
         for (const dp of this.datenpunkte) {
             const fullId = this.config.basePath + dp.id;
-            let initialValue = dp.type === "number" ? 0 : (dp.def !== undefined ? dp.def : "");
-            
-            await createStateAsync(fullId, initialValue, false, {
-                name: dp.name, desc: dp.name, type: dp.type, role: dp.role, unit: dp.unit, read: true, write: true
+            const def    = dp.type === "number" ? (dp.def !== undefined ? dp.def : 0)
+                                                : (dp.def !== undefined ? dp.def : "");
+            await createStateAsync(fullId, def, false, {
+                name: dp.name, desc: dp.desc || dp.name,
+                type: dp.type, role: dp.role, unit: dp.unit,
+                read: true, write: true
             });
         }
     }
 
+    // -------------------------------------------------------------------------
+    // METRIKEN
+    // -------------------------------------------------------------------------
     async ladeMetriken() {
         if (!this.config.metrikSpeichern) return;
-        let uP = await getStateAsync(this.config.basePath + "Strom_Metriken_Updates_verarbeitet");
-        if (uP) this.metrics.updatesProcessed = uP.val || 0;
-
-        let err = await getStateAsync(this.config.basePath + "Strom_Metriken_Fehleranzahl");
-        if (err) this.metrics.errors = err.val || 0;
-
-        let rD = await getStateAsync(this.config.basePath + "Strom_Metriken_Resets_erkannt");
-        if (rD) this.metrics.resetsDetected = rD.val || 0;
-
-        let lU = await getStateAsync(this.config.basePath + "Strom_Metriken_Letztes_Update");
-        if (lU) this.metrics.lastUpdateTime = lU.val || "";
+        const laden = async (id, prop) => {
+            const s = await getStateAsync(this.config.basePath + id);
+            if (s) this.metrics[prop] = s.val || 0;
+        };
+        await laden("Strom_Metriken_Updates_verarbeitet", "updatesProcessed");
+        await laden("Strom_Metriken_Fehleranzahl",        "errors");
+        await laden("Strom_Metriken_Resets_erkannt",      "resetsDetected");
     }
 
     async speichereMetriken(force = false) {
         if (!this.config.metrikSpeichern) return;
-        
-        // Nur speichern, wenn force true ist oder das definierte Intervall erreicht wurde
-        if (force || (this.config.metrikUpdateIntervall > 0 && this.metrics.updatesProcessed % this.config.metrikUpdateIntervall === 0)) {
-            await this.schreibeWertAsync("Strom_Metriken_Updates_verarbeitet", this.metrics.updatesProcessed);
-            await this.schreibeWertAsync("Strom_Metriken_Letztes_Update", this.metrics.lastUpdateTime);
-            await this.schreibeWertAsync("Strom_Metriken_Resets_erkannt", this.metrics.resetsDetected);
-            await this.schreibeWertAsync("Strom_Metriken_Fehleranzahl", this.metrics.errors);
-        }
+        if (!force && !(this.config.metrikUpdateIntervall > 0 && this.metrics.updatesProcessed % this.config.metrikUpdateIntervall === 0)) return;
+        await this.schreibeWertAsync("Strom_Metriken_Updates_verarbeitet", this.metrics.updatesProcessed);
+        await this.schreibeWertAsync("Strom_Metriken_Letztes_Update",      this.metrics.lastUpdateTime);
+        await this.schreibeWertAsync("Strom_Metriken_Resets_erkannt",      this.metrics.resetsDetected);
+        await this.schreibeWertAsync("Strom_Metriken_Fehleranzahl",        this.metrics.errors);
     }
 
-    /**
-     * Zentralisierte Fehlerbehandlung
-     */
     async handleError(method, error) {
         this.metrics.errors++;
         log(`Fehler in ${method}: ${error.message}`, "error");
-        
         if (this.config.metrikSpeichern) {
-            await this.schreibeWertAsync("Strom_Metriken_Fehleranzahl", this.metrics.errors);
+            await this.schreibeWertAsync("Strom_Metriken_Fehleranzahl",  this.metrics.errors);
             await this.schreibeWertAsync("Strom_Metriken_Letzter_Fehler", `${Utils.formatiereDatum(new Date())}: ${error.message}`);
         }
     }
 
+    // -------------------------------------------------------------------------
+    // INITIALRUN
+    // -------------------------------------------------------------------------
     async fuehreInitialRunAus() {
-        const referenzHeute = await getStateAsync(this.config.basePath + "Strom_Referenz_heute");
-        if (!referenzHeute || referenzHeute.val === null || referenzHeute.val === 0) {
-            log("Erster Start erkannt: Initialisiere Referenzwerte auf aktuellen Zählerstand...", "info");
-            const initialEnergy = await getStateAsync(this.config.sources.energy);
-            
-            if (initialEnergy && typeof initialEnergy.val === "number") {
-                let zaehlerStartOffset = this.holeWert("Strom_Zaehler_Startoffset") || 0;
-                
-                // NEU: Wir kompensieren den internen Speicher des Zigbee-Sensors beim Erst-Start!
-                // Dadurch entspricht der Live-Zählerstand exakt dem eingetragenen Startoffset.
-                let geraeteOffset = Utils.rundenKwh(-initialEnergy.val);
+        // Hauptzähler Referenz initialisieren falls erster Start
+        const refHeute = await getStateAsync(this.config.basePath + "Strom_Referenz_heute");
+        if (!refHeute || !refHeute.val) {
+            log("Erster Start: Initialisiere Referenzwerte...", "info");
+            const initEnergy = await getStateAsync(this.config.sources.energy);
+            if (initEnergy && typeof initEnergy.val === "number") {
+                const startOffset    = this.holeWert("Strom_Zaehler_Startoffset") || 0;
+                const geraeteOffset  = Utils.rundenKwh(-initEnergy.val);
                 await this.schreibeWertAsync("Strom_Geraete_Offset", geraeteOffset);
-                
-                let calcZaehlerstand = Utils.rundenKwh(initialEnergy.val + zaehlerStartOffset + geraeteOffset);
-                
-                await this.schreibeWertAsync("Strom_Referenz_heute", calcZaehlerstand);
-                await this.schreibeWertAsync("Strom_Referenz_Woche", calcZaehlerstand);
-                await this.schreibeWertAsync("Strom_Referenz_Monat", calcZaehlerstand);
-                await this.schreibeWertAsync("Strom_Referenz_Kalenderjahr", calcZaehlerstand);
-                await this.schreibeWertAsync("Strom_Referenz_Ablesung", calcZaehlerstand);
+                const stand = Utils.rundenKwh(initEnergy.val + startOffset + geraeteOffset);
+                for (const ref of ["Strom_Referenz_heute","Strom_Referenz_Woche","Strom_Referenz_Monat","Strom_Referenz_Kalenderjahr","Strom_Referenz_Ablesung"])
+                    await this.schreibeWertAsync(ref, stand);
             }
         }
 
-        let initialEnergy = await getStateAsync(this.config.sources.energy);
-        if (initialEnergy && typeof initialEnergy.val === "number") {
-            await this.verarbeiteNeuenZaehlerstand(initialEnergy.val);
+        // Hauptzähler initial verarbeiten
+        const initEnergy = await getStateAsync(this.config.sources.energy);
+        if (initEnergy && typeof initEnergy.val === "number")
+            await this.verarbeiteNeuenZaehlerstand(initEnergy.val);
+
+        const initPower = await getStateAsync(this.config.sources.power);
+        if (initPower && typeof initPower.val === "number") {
+            await this.schreibeWertAsync("Strom_Verbrauch_aktuell", initPower.val, true);
+            await this.aktualisiereNettoLeistung();
         }
-        let initialPower = await getStateAsync(this.config.sources.power);
-        if (initialPower && typeof initialPower.val === "number") {
-            await this.schreibeWertAsync("Strom_Verbrauch_aktuell", initialPower.val, true);
+
+        // PV Timestamp initialisieren, falls noch 0 (verhindert Riesenwert beim ersten Watt-Update)
+        const pvTs = await getStateAsync(this.config.basePath + "PV_Letzter_Timestamp");
+        if (!pvTs || pvTs.val === 0)
+            await this.schreibeWertAsync("PV_Letzter_Timestamp", Date.now());
+
+        const initPvPower = await getStateAsync(this.config.pv.power);
+        if (initPvPower && typeof initPvPower.val === "number") {
+            await this.schreibeWertAsync("PV_Leistung_aktuell",   initPvPower.val, true);
+            await this.schreibeWertAsync("PV_Letzter_Wattwert",   initPvPower.val);
+            await this.aktualisiereNettoLeistung();
         }
     }
 
+    // -------------------------------------------------------------------------
+    // VERPASSTE WECHSEL
+    // -------------------------------------------------------------------------
     async pruefeVerpassteWechsel() {
-        const letztesSpeicherDatum = this.holeWert("Strom_Letztes_Speicher_Datum");
-        if (!letztesSpeicherDatum) return;
-
+        const letztes = this.holeWert("Strom_Letztes_Speicher_Datum");
+        if (!letztes) return;
         const heute = new Date();
-        const heuteString = Utils.heuteIso();
-        
-        if (letztesSpeicherDatum !== heuteString) {
-            log(`Verpasster Tageswechsel erkannt (Letzte Speicherung: ${letztesSpeicherDatum}). Hole Daten nach...`, "warn");
-            await this.schichteTagesWerteUm();
+        if (letztes === Utils.heuteIso()) return;
 
-            const letztesDatumObj = new Date(letztesSpeicherDatum);
-            
-            let missedWeeks = Utils.getIsoWeek(heute) - Utils.getIsoWeek(letztesDatumObj);
-            if (missedWeeks < 0) missedWeeks += 52; 
-            
-            if (missedWeeks > 0 || letztesDatumObj.getFullYear() !== heute.getFullYear()) {
-                let iterations = missedWeeks > 0 ? missedWeeks : 1;
-                for (let i = 0; i < iterations; i++) {
-                    await this.schichteWochenWerteUm();
-                }
-            }
-            if (letztesDatumObj.getMonth() !== heute.getMonth() || letztesDatumObj.getFullYear() !== heute.getFullYear()) {
-                await this.schichteMonatsWerteUm();
-            }
-            if (letztesDatumObj.getFullYear() !== heute.getFullYear()) {
-                await this.schichteJahresWerteUm();
-            }
-        }
+        log(`Verpasster Tageswechsel (letzte Speicherung: ${letztes}). Hole nach...`, "warn");
+        await this.schichteTagesWerteUm();
+
+        const letztesDatum = new Date(letztes);
+        let missedWeeks = Utils.getIsoWeek(heute) - Utils.getIsoWeek(letztesDatum);
+        if (missedWeeks < 0) missedWeeks += 52;
+        if (missedWeeks > 0 || letztesDatum.getFullYear() !== heute.getFullYear())
+            for (let i = 0; i < (missedWeeks || 1); i++) await this.schichteWochenWerteUm();
+        if (letztesDatum.getMonth() !== heute.getMonth() || letztesDatum.getFullYear() !== heute.getFullYear())
+            await this.schichteMonatsWerteUm();
+        if (letztesDatum.getFullYear() !== heute.getFullYear())
+            await this.schichteJahresWerteUm();
     }
 
+    // -------------------------------------------------------------------------
+    // TRIGGER
+    // -------------------------------------------------------------------------
     registriereTrigger() {
+        // Hauptzähler Energie
         this.subscriptions.push(on({ id: this.config.sources.energy, change: "ne" }, async (obj) => {
-            try {
-                // Batch-Processing anstelle direkter Verarbeitung
-                this.queueUpdate(obj.state.val);
-            } catch (error) {
-                await this.handleError("Trigger: energy", error);
-            }
+            try { this.queueUpdate(obj.state.val); }
+            catch (e) { await this.handleError("Trigger: energy", e); }
         }));
 
+        // Hauptzähler Leistung
         this.subscriptions.push(on({ id: this.config.sources.power, change: "ne" }, async (obj) => {
             try {
                 await this.schreibeWertAsync("Strom_Verbrauch_aktuell", obj.state.val, true);
-            } catch (error) {
-                await this.handleError("Trigger: power", error);
-            }
+                await this.aktualisiereNettoLeistung();
+            } catch (e) { await this.handleError("Trigger: power", e); }
         }));
 
+        // PV Leistung → Trapezintegration + Netto
+        this.subscriptions.push(on({ id: this.config.pv.power, change: "ne" }, async (obj) => {
+            try {
+                const neuerWatt = obj.state.val;
+                await this.schreibeWertAsync("PV_Leistung_aktuell", neuerWatt, true);
+                await this.akkumulierePvErtrag(neuerWatt);
+                await this.aktualisiereNettoLeistung();
+                await this.aktualisiereNettoEnergiePerioden();
+            } catch (e) { await this.handleError("Trigger: PV power", e); }
+        }));
+
+        // Manuelle Ablesung
         this.subscriptions.push(on({ id: this.config.basePath + "Strom_Ablesung_Trigger", change: "any", val: true }, async () => {
-            try {
-                await this.fuehreManuelleAblesungAus();
-            } catch (error) {
-                await this.handleError("Trigger: Manuelle Ablesung", error);
-            }
+            try { await this.fuehreManuelleAblesungAus(); }
+            catch (e) { await this.handleError("Trigger: Manuelle Ablesung", e); }
         }));
 
+        // Zählerwechsel
         this.subscriptions.push(on({ id: this.config.basePath + "Strom_Zaehlerwechsel_Trigger", change: "any", val: true }, async () => {
-            try {
-                await this.fuehreZaehlerwechselAus();
-            } catch (error) {
-                await this.handleError("Trigger: Zählerwechsel", error);
-            }
+            try { await this.fuehreZaehlerwechselAus(); }
+            catch (e) { await this.handleError("Trigger: Zählerwechsel", e); }
         }));
     }
 
+    // -------------------------------------------------------------------------
+    // CRONJOBS
+    // -------------------------------------------------------------------------
     registriereCronjobs() {
-        schedule("59 59 23 * * *", async () => {
-            try { await this.schichteTagesWerteUm(); } catch(e) { await this.handleError("Cron: Tageswechsel", e); }
-        });
-        
-        schedule("59 59 23 * * 0", async () => {
-            try { await this.schichteWochenWerteUm(); } catch(e) { await this.handleError("Cron: Wochenwechsel", e); }
-        });
-        
+        schedule("59 59 23 * * *",   async () => { try { await this.schichteTagesWerteUm();  } catch (e) { await this.handleError("Cron: Tageswechsel",   e); } });
+        schedule("59 59 23 * * 0",   async () => { try { await this.schichteWochenWerteUm(); } catch (e) { await this.handleError("Cron: Wochenwechsel",  e); } });
         schedule("59 59 23 28-31 * *", async () => {
             try {
-                let morgen = new Date();
-                morgen.setDate(morgen.getDate() + 1);
+                const morgen = new Date(); morgen.setDate(morgen.getDate() + 1);
                 if (morgen.getDate() === 1) await this.schichteMonatsWerteUm();
-            } catch(e) { await this.handleError("Cron: Monatswechsel", e); }
+            } catch (e) { await this.handleError("Cron: Monatswechsel", e); }
         });
-        
-        schedule("59 59 23 31 12 *", async () => {
-            try { await this.schichteJahresWerteUm(); } catch(e) { await this.handleError("Cron: Jahreswechsel", e); }
-        });
-
-        // Tägliche Zwangs-Speicherung der Metriken kurz vor dem Tageswechsel
-        schedule("55 23 * * *", async () => {
-            try { await this.speichereMetriken(true); } catch(e) { await this.handleError("Cron: Metriken Sync", e); }
-        });
+        schedule("59 59 23 31 12 *", async () => { try { await this.schichteJahresWerteUm(); } catch (e) { await this.handleError("Cron: Jahreswechsel",  e); } });
+        schedule("55 23 * * *",       async () => { try { await this.speichereMetriken(true); } catch (e) { await this.handleError("Cron: Metriken",       e); } });
     }
 
-    /**
-     * Fügt einen Wert der Queue hinzu (Burst-Schutz).
-     */
+    // -------------------------------------------------------------------------
+    // BATCH-SCHUTZ
+    // -------------------------------------------------------------------------
     queueUpdate(wert) {
         this.updateQueue.push(wert);
-        if (!this.batchTimeout) {
-            this.batchTimeout = setTimeout(() => this.processBatch(), 100);
-        }
+        if (!this.batchTimeout) this.batchTimeout = setTimeout(() => this.processBatch(), 100);
     }
 
-    /**
-     * Verarbeitet gepufferte Updates in einem Rutsch.
-     */
     async processBatch() {
         this.batchTimeout = null;
         const updates = [...this.updateQueue];
         this.updateQueue = [];
-
-        for (const wert of updates) {
-            try {
-                await this.verarbeiteNeuenZaehlerstand(wert);
-            } catch (error) {
-                await this.handleError("Batch-Verarbeitung", error);
-            }
+        for (const w of updates) {
+            try { await this.verarbeiteNeuenZaehlerstand(w); }
+            catch (e) { await this.handleError("Batch", e); }
         }
     }
 
-    /**
-     * Holt States aus dem internen Memory-Cache (Reduziert DB-Abfragen).
-     */
+    // -------------------------------------------------------------------------
+    // STATE CACHE & HELPER
+    // -------------------------------------------------------------------------
     async getStateCached(id) {
         const now = Date.now();
-        if (this.stateCache.has(id) && (now - this.stateCache.get(id).timestamp < this.cacheTTL)) {
-            return this.stateCache.get(id).value;
-        }
-        const stateObj = await getStateAsync(id);
-        const value = (stateObj && stateObj.val !== null && stateObj.val !== undefined) ? stateObj.val : null;
-        this.stateCache.set(id, { value, timestamp: now });
-        return value;
+        const hit = this.stateCache.get(id);
+        if (hit && (now - hit.timestamp < this.cacheTTL)) return hit.value;
+        const s = await getStateAsync(id);
+        const v = (s && s.val !== null && s.val !== undefined) ? s.val : null;
+        this.stateCache.set(id, { value: v, timestamp: now });
+        return v;
     }
 
-    /**
-     * Holt einen Wert synchron ab (hauptsächlich intern als Fallback genutzt).
-     */
     holeWert(idSuffix) {
-        let state = getState(this.config.basePath + idSuffix);
-        if (!state || state.val === null || state.val === undefined || state.val === "") return null;
-        return state.val;
+        const s = getState(this.config.basePath + idSuffix);
+        if (!s || s.val === null || s.val === undefined || s.val === "") return null;
+        return s.val;
     }
 
-    /**
-     * Asynchrones, versionssicheres Schreiben in die Datenbank mit Cache-Check.
-     */
     async schreibeWertAsync(idSuffix, wert, ack = true) {
         const fullId = this.config.basePath + idSuffix;
-        const currentStateVal = await this.getStateCached(fullId);
-        
-        if (currentStateVal !== wert) {
-            // Cache direkt vor dem Schreiben aktualisieren, damit parallele Aufrufe blockierungsfrei den neuen Wert kennen
+        const aktuell = await this.getStateCached(fullId);
+        if (aktuell !== wert) {
             this.stateCache.set(fullId, { value: wert, timestamp: Date.now() });
-
-            if (typeof setStateAsync === 'function') {
-                await setStateAsync(fullId, wert, ack);
-            } else {
-                setState(fullId, wert, ack); // Fallback für ältere ioBroker Installationen
-            }
+            typeof setStateAsync === 'function'
+                ? await setStateAsync(fullId, wert, ack)
+                : setState(fullId, wert, ack);
         }
     }
 
-    /**
-     * Hauptverarbeitungslogik für eingehende Energiewerte.
-     */
-    async verarbeiteNeuenZaehlerstand(neuerWertKwh) {
-        if (this.processingLock) {
-            if (this.config.debug) log("Update wird bereits verarbeitet, ignoriere parallelen Aufruf (Mutex)", "debug");
+    // -------------------------------------------------------------------------
+    // PV — TRAPEZINTEGRATION
+    // Energie (kWh) = (W_alt + W_neu) / 2 × Δt(h)
+    // Wird bei jedem neuen load_power-Wert aufgerufen.
+    // -------------------------------------------------------------------------
+    async akkumulierePvErtrag(neuerWattWert) {
+        const jetzt        = Date.now();
+        const letzterTs    = await this.getStateCached(this.config.basePath + "PV_Letzter_Timestamp") ?? jetzt;
+        const letzterWatt  = await this.getStateCached(this.config.basePath + "PV_Letzter_Wattwert")  ?? 0;
+
+        const deltaStunden = (jetzt - letzterTs) / 3_600_000; // ms → h
+
+        // Plausibilitätsprüfung: Intervall > 2h oder < 1s ignorieren
+        if (deltaStunden > 2 || deltaStunden < 0.0003) {
+            await this.schreibeWertAsync("PV_Letzter_Timestamp", jetzt);
+            await this.schreibeWertAsync("PV_Letzter_Wattwert",  neuerWattWert);
+            if (this.config.debug) log(`[PV] Trapez übersprungen: Δt=${deltaStunden.toFixed(4)}h`, "info");
             return;
         }
-        
+
+        // Trapezregel: Fläche unter der Leistungskurve
+        const deltaKwh = Utils.rundenKwh(((letzterWatt + neuerWattWert) / 2) * deltaStunden / 1000);
+
+        if (deltaKwh < 0) {
+            // Negative Leistung ignorieren (Sensor-Artefakt)
+            await this.schreibeWertAsync("PV_Letzter_Timestamp", jetzt);
+            await this.schreibeWertAsync("PV_Letzter_Wattwert",  neuerWattWert);
+            return;
+        }
+
+        if (this.config.debug)
+            log(`[PV] Trapez: ${letzterWatt}W → ${neuerWattWert}W, Δt=${deltaStunden.toFixed(4)}h, +${deltaKwh}kWh`, "info");
+
+        // Auf alle Akkumulatoren addieren
+        for (const id of ["PV_Ertrag_heute","PV_Ertrag_Woche","PV_Ertrag_Monat","PV_Ertrag_Kalenderjahr"]) {
+            const aktuell = await this.getStateCached(this.config.basePath + id) ?? 0;
+            await this.schreibeWertAsync(id, Utils.rundenKwh(aktuell + deltaKwh));
+        }
+
+        // Hilfswerte aktualisieren
+        await this.schreibeWertAsync("PV_Letzter_Timestamp", jetzt);
+        await this.schreibeWertAsync("PV_Letzter_Wattwert",  neuerWattWert);
+    }
+
+    // -------------------------------------------------------------------------
+    // NETTO-BERECHNUNGEN
+    // -------------------------------------------------------------------------
+    async aktualisiereNettoLeistung() {
+        const brutto = await this.getStateCached(this.config.basePath + "Strom_Verbrauch_aktuell") ?? 0;
+        const pv     = await this.getStateCached(this.config.basePath + "PV_Leistung_aktuell")    ?? 0;
+        await this.schreibeWertAsync("Strom_Netto_Leistung", Math.round(brutto - pv), true);
+    }
+
+    async aktualisiereNettoEnergiePerioden() {
+        const perioden = [
+            { brutto: "Strom_Verbrauch_heute",        pv: "PV_Ertrag_heute",        netto: "Strom_Netto_Verbrauch_heute"         },
+            { brutto: "Strom_Verbrauch_gestern",      pv: "PV_Ertrag_gestern",      netto: "Strom_Netto_Verbrauch_gestern"       },
+            { brutto: "Strom_Verbrauch_Woche",        pv: "PV_Ertrag_Woche",        netto: "Strom_Netto_Verbrauch_Woche"         },
+            { brutto: "Strom_Verbrauch_Monat",        pv: "PV_Ertrag_Monat",        netto: "Strom_Netto_Verbrauch_Monat"         },
+            { brutto: "Strom_Verbrauch_Kalenderjahr", pv: "PV_Ertrag_Kalenderjahr", netto: "Strom_Netto_Verbrauch_Kalenderjahr"  }
+        ];
+        for (const p of perioden) {
+            const b = await this.getStateCached(this.config.basePath + p.brutto) ?? 0;
+            const v = await this.getStateCached(this.config.basePath + p.pv)    ?? 0;
+            await this.schreibeWertAsync(p.netto, Utils.rundenKwh(b - v));
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // HAUPTVERARBEITUNG HAUSHALTSZÄHLER
+    // -------------------------------------------------------------------------
+    async verarbeiteNeuenZaehlerstand(neuerWertKwh) {
+        if (this.processingLock) return;
         this.processingLock = true;
-        const startTime = Date.now();
-        
+        const t0 = Date.now();
         try {
             if (typeof neuerWertKwh !== "number" || isNaN(neuerWertKwh)) return;
 
-            // Nutzung des neuen Memory-Caches anstelle von getStatesAsync Bulk-Reads
-            let letzterRohwert = await this.getStateCached(this.config.basePath + "Strom_Letzter_Rohwert") ?? 0;
-            let geraeteOffset = await this.getStateCached(this.config.basePath + "Strom_Geraete_Offset") ?? 0;
-            
-            // 1. Reset- und Fehlererkennung
-            const status = this.pruefeAufReset(neuerWertKwh, letzterRohwert, geraeteOffset);
-            
-            // Reset-Timer aufräumen, falls der Status sich geklärt hat
-            if (status.aktion !== "PENDING" && this.pendingResetTimer) {
-                clearTimeout(this.pendingResetTimer);
-                this.pendingResetTimer = null;
-            }
+            const letzterRohwert = await this.getStateCached(this.config.basePath + "Strom_Letzter_Rohwert") ?? 0;
+            let   geraeteOffset  = await this.getStateCached(this.config.basePath + "Strom_Geraete_Offset")  ?? 0;
 
+            const status = this.pruefeAufReset(neuerWertKwh, letzterRohwert, geraeteOffset);
+            if (status.aktion !== "PENDING" && this.pendingResetTimer) { clearTimeout(this.pendingResetTimer); this.pendingResetTimer = null; }
             if (status.aktion === "ABBRUCH" || status.aktion === "PENDING") return;
 
             if (status.neuerOffset !== null) {
                 geraeteOffset = status.neuerOffset;
-                await this.schreibeWertAsync("Strom_Geraete_Offset", geraeteOffset);
-                await this.schreibeWertAsync("Strom_Datum_Batterietausch", Utils.formatiereDatum(new Date()));
-                
+                await this.schreibeWertAsync("Strom_Geraete_Offset",       geraeteOffset);
+                await this.schreibeWertAsync("Strom_Datum_Batterietausch",  Utils.formatiereDatum(new Date()));
                 this.metrics.resetsDetected++;
-                await this.speichereMetriken(true); // Bei Resets Metriken immer sofort sichern
+                await this.speichereMetriken(true);
             }
 
             await this.schreibeWertAsync("Strom_Letzter_Rohwert", neuerWertKwh);
 
-            // 2. Gesamtzählerstand berechnen
-            let zaehlerStartOffset = await this.getStateCached(this.config.basePath + "Strom_Zaehler_Startoffset") ?? 0;
-            let aktuellerZaehlerstand = Utils.rundenKwh(neuerWertKwh + zaehlerStartOffset + geraeteOffset);
-            
-            // Plausibilitätsprüfung
-            if (aktuellerZaehlerstand < 0) {
-                log(`WARNUNG: Zählerstand negativ (${aktuellerZaehlerstand} kWh)! Offset oder Startwert prüfen.`, "warn");
-                aktuellerZaehlerstand = 0; 
-            }
-            
-            // Erweiterte Plausibilitätsprüfung
-            if (this.letzterPlausiblerZaehlerstand !== null && aktuellerZaehlerstand < this.letzterPlausiblerZaehlerstand) {
-                log(`WARNUNG: Zählerstand ist gesunken (${this.letzterPlausiblerZaehlerstand} -> ${aktuellerZaehlerstand} kWh).`, "warn");
-            }
-            this.letzterPlausiblerZaehlerstand = aktuellerZaehlerstand;
+            const startOffset = await this.getStateCached(this.config.basePath + "Strom_Zaehler_Startoffset") ?? 0;
+            let stand         = Utils.rundenKwh(neuerWertKwh + startOffset + geraeteOffset);
 
-            // Automatische Korrektur bei systematischen Fehlern (Hook)
-            if (this.systematischeAbweichung > 0.1) {
-                log(`Systematische Abweichung erkannt: ${this.systematischeAbweichung} kWh. Automatische Kalibrierung empfohlen.`, "warn");
-                // Hier kann zukünftig eine automatische Offset-Korrektur eingefügt werden
-            }
-            
-            await this.schreibeWertAsync("Strom_Zaehlerstand", aktuellerZaehlerstand);
+            if (stand < 0) { log(`WARNUNG: Zählerstand negativ (${stand} kWh)!`, "warn"); stand = 0; }
+            if (this.letzterPlausiblerZaehlerstand !== null && stand < this.letzterPlausiblerZaehlerstand)
+                log(`WARNUNG: Zählerstand gesunken (${this.letzterPlausiblerZaehlerstand} → ${stand} kWh).`, "warn");
+            this.letzterPlausiblerZaehlerstand = stand;
+
+            await this.schreibeWertAsync("Strom_Zaehlerstand",  stand);
             await this.schreibeWertAsync("Strom_Aktualisierung", Utils.formatiereDatum(new Date()));
 
-            // 3. Verbräuche aktualisieren
-            await this.aktualisiereVerbrauchswerte(aktuellerZaehlerstand);
+            await this.aktualisiereVerbrauchswerte(stand);
+            await this.aktualisiereNettoEnergiePerioden();
 
-            // Metriken pflegen & ressourcenschonend speichern
             this.metrics.updatesProcessed++;
             this.metrics.lastUpdateTime = new Date().toISOString();
             await this.speichereMetriken();
 
         } finally {
             this.processingLock = false;
-            
-            // Performance-Monitoring
-            const duration = Date.now() - startTime;
-            if (duration > 500) {
-                log(`WARN: Verarbeitung des Zählerstands dauerte ${duration}ms. Das Event-Loop wird evtl. stark belastet.`, "warn");
-            }
+            const d = Date.now() - t0;
+            if (d > 500) log(`WARN: Verarbeitung dauerte ${d}ms`, "warn");
         }
     }
 
-    /**
-     * @returns {{aktion: "OK" | "ABBRUCH" | "PENDING", neuerOffset: number | null}}
-     */
-    pruefeAufReset(neuerWertKwh, letzterRohwert, aktuellerOffset) {
-        if (letzterRohwert === 0 && neuerWertKwh > 0) return { aktion: "OK", neuerOffset: null };
+    // -------------------------------------------------------------------------
+    // RESET-ERKENNUNG
+    // -------------------------------------------------------------------------
+    pruefeAufReset(neu, letzt, offset) {
+        if (letzt === 0 && neu > 0) return { aktion: "OK", neuerOffset: null };
+        const diff = neu - letzt;
+        if (this.config.debug) log(`[DEBUG] Reset-Check: neu=${neu}, letzt=${letzt}, diff=${Utils.rundenKwh(diff)}`, "info");
 
-        let differenz = neuerWertKwh - letzterRohwert;
-
-        if (this.config.debug) {
-            log(`[DEBUG] Reset-Prüfung: pending=${this.pendingResetVerdacht}, neuerWert=${neuerWertKwh}, letzter=${letzterRohwert}, diff=${Utils.rundenKwh(differenz)}`, "info");
-        }
-
-        if (differenz > this.config.maxZulaessigerSprungKwh) {
-            if (this.config.debug) log(`[DEBUG] Aktion: ABBRUCH (Unrealistischer Sprung nach oben)`, "info");
-            log(`Unrealistischer Sprung (+${Utils.rundenKwh(differenz)} kWh). Ignoriere Wert!`, "warn");
+        if (diff > this.config.maxZulaessigerSprungKwh) {
+            log(`Unrealistischer Sprung (+${Utils.rundenKwh(diff)} kWh). Ignoriere Wert!`, "warn");
             return { aktion: "ABBRUCH", neuerOffset: null };
         }
 
-        if (neuerWertKwh < letzterRohwert) {
-            if (Math.abs(differenz) < this.config.minResetSchwelleKwh) {
-                if (this.config.debug) log(`[DEBUG] Aktion: ABBRUCH (Mikro-Jitter)`, "info");
-                return { aktion: "ABBRUCH", neuerOffset: null };
-            }
+        if (neu < letzt) {
+            if (Math.abs(diff) < this.config.minResetSchwelleKwh) return { aktion: "ABBRUCH", neuerOffset: null };
 
             if (this.pendingResetVerdacht) {
-                if (neuerWertKwh < this.config.maxZulaessigerSprungKwh) {
-                    log(`Sensor-Reset bestätigt! Setze neuen Offset.`, "info");
-                    let neuerOffset = Utils.rundenKwh(aktuellerOffset + (letzterRohwert - neuerWertKwh));
+                if (neu < this.config.maxZulaessigerSprungKwh) {
+                    log("Sensor-Reset bestätigt. Setze neuen Offset.", "info");
                     this.pendingResetVerdacht = false;
-                    return { aktion: "OK", neuerOffset: neuerOffset };
+                    return { aktion: "OK", neuerOffset: Utils.rundenKwh(offset + (letzt - neu)) };
                 } else {
-                    log(`"Falsche 0" abgewehrt! Sensor liefert wieder normale Werte.`, "info");
+                    log('"Falsche 0" abgewehrt.', "info");
                     this.pendingResetVerdacht = false;
                     return { aktion: "OK", neuerOffset: null };
                 }
             } else {
-                log(`Wert fiel plötzlich auf ${neuerWertKwh} kWh. Warte auf Bestätigung...`, "warn");
+                log(`Wert fiel auf ${neu} kWh. Warte auf Bestätigung...`, "warn");
                 this.pendingResetVerdacht = true;
-                
-                // Timeout-Schutz: Falls der Sensor nach einem Absturz ewig offline bleibt
                 if (this.pendingResetTimer) clearTimeout(this.pendingResetTimer);
                 this.pendingResetTimer = setTimeout(() => {
-                    log("Pending-Reset-Status nach 1 Stunde ohne Bestätigung zurückgesetzt. Sensor evtl. defekt/offline.", "warn");
+                    log("Pending-Reset nach 1h zurückgesetzt.", "warn");
                     this.pendingResetVerdacht = false;
-                }, 60 * 60 * 1000); // 1 Stunde
-
+                }, 3_600_000);
                 return { aktion: "PENDING", neuerOffset: null };
             }
         } else {
-            if (this.pendingResetVerdacht) {
-                this.pendingResetVerdacht = false;
-                if (this.config.debug) log(`[DEBUG] Pending-Status verworfen, Wert steigt wieder normal.`, "info");
-            }
+            if (this.pendingResetVerdacht) { this.pendingResetVerdacht = false; }
             return { aktion: "OK", neuerOffset: null };
         }
     }
 
-    async aktualisiereVerbrauchswerte(aktuellerZaehlerstand) {
+    // -------------------------------------------------------------------------
+    // VERBRAUCHSWERTE
+    // -------------------------------------------------------------------------
+    async aktualisiereVerbrauchswerte(stand) {
         const perioden = [
-            { ref: "Strom_Referenz_heute", ziel: "Strom_Verbrauch_heute" },
-            { ref: "Strom_Referenz_Woche", ziel: "Strom_Verbrauch_Woche" },
-            { ref: "Strom_Referenz_Monat", ziel: "Strom_Verbrauch_Monat" },
-            { ref: "Strom_Referenz_Kalenderjahr", ziel: "Strom_Verbrauch_Kalenderjahr" },
-            { ref: "Strom_Referenz_Ablesung", ziel: "Strom_Verbrauch_letzte_Ablesung" }
+            { ref: "Strom_Referenz_heute",        ziel: "Strom_Verbrauch_heute"          },
+            { ref: "Strom_Referenz_Woche",        ziel: "Strom_Verbrauch_Woche"          },
+            { ref: "Strom_Referenz_Monat",        ziel: "Strom_Verbrauch_Monat"          },
+            { ref: "Strom_Referenz_Kalenderjahr", ziel: "Strom_Verbrauch_Kalenderjahr"   },
+            { ref: "Strom_Referenz_Ablesung",     ziel: "Strom_Verbrauch_letzte_Ablesung"}
         ];
-
-        // Die Werte werden einzeln via Cache bezogen, was DB-Abfragen eliminiert
         for (const p of perioden) {
-            const fullId = this.config.basePath + p.ref;
-            let referenz = await this.getStateCached(fullId);
-
-            if (referenz === null || referenz === undefined) {
-                await this.schreibeWertAsync(p.ref, aktuellerZaehlerstand);
-                referenz = aktuellerZaehlerstand;
-            }
-            
-            let verbrauch = Utils.rundenKwh(aktuellerZaehlerstand - referenz);
-            await this.schreibeWertAsync(p.ziel, verbrauch);
+            let ref = await this.getStateCached(this.config.basePath + p.ref);
+            if (ref === null) { await this.schreibeWertAsync(p.ref, stand); ref = stand; }
+            await this.schreibeWertAsync(p.ziel, Utils.rundenKwh(stand - ref));
         }
     }
 
+    // -------------------------------------------------------------------------
+    // MANUELLE ABLESUNG
+    // -------------------------------------------------------------------------
     async fuehreManuelleAblesungAus() {
         log("Manuelle Ablesung ausgelöst.", "info");
-        let aktuellerZaehlerstand = this.holeWert("Strom_Zaehlerstand") || 0;
-        await this.schreibeWertAsync("Strom_Datum_letzte_Ablesung", Utils.formatiereDatum(new Date()));
-        await this.schreibeWertAsync("Strom_Referenz_Ablesung", aktuellerZaehlerstand);
+        const stand = this.holeWert("Strom_Zaehlerstand") || 0;
+        await this.schreibeWertAsync("Strom_Datum_letzte_Ablesung",     Utils.formatiereDatum(new Date()));
+        await this.schreibeWertAsync("Strom_Referenz_Ablesung",         stand);
         await this.schreibeWertAsync("Strom_Verbrauch_letzte_Ablesung", 0);
-        
-        await this.schreibeWertAsync("Strom_Ablesung_Trigger", false, true);
+        await this.schreibeWertAsync("Strom_Ablesung_Trigger",          false, true);
     }
 
+    // -------------------------------------------------------------------------
+    // ZÄHLERWECHSEL
+    // -------------------------------------------------------------------------
     async fuehreZaehlerwechselAus() {
-        if (this.processingLock) {
-            log("Verarbeitung gesperrt, versuche Zählerwechsel später erneut.", "warn");
-            return;
-        }
+        if (this.processingLock) { log("Lock aktiv. Später erneut versuchen.", "warn"); return; }
         this.processingLock = true;
-        
         try {
-            let neuerZaehlerstand = this.holeWert("Strom_Zaehlerwechsel_Neuer_Wert");
-            if (typeof neuerZaehlerstand !== "number" || isNaN(neuerZaehlerstand)) {
-                log("Fehler beim Zählerwechsel: Ungültiger neuer Zählerstand.", "error");
-                return;
+            const neuer = this.holeWert("Strom_Zaehlerwechsel_Neuer_Wert");
+            if (typeof neuer !== "number" || isNaN(neuer)) { log("Zählerwechsel: Ungültiger Wert.", "error"); return; }
+            const aktuell = await this.getStateCached(this.config.basePath + "Strom_Zaehlerstand") ?? 0;
+            const diff    = neuer - aktuell;
+            if (Math.abs(diff) < 0.001) { log("Zählerwechsel: Wert bereits aktuell.", "info"); return; }
+
+            log(`Zählerwechsel: ${aktuell} → ${neuer} kWh (Δ${diff})`, "info");
+            const altOffset = await this.getStateCached(this.config.basePath + "Strom_Zaehler_Startoffset") ?? 0;
+            await this.schreibeWertAsync("Strom_Zaehler_Startoffset", Utils.rundenKwh(altOffset + diff));
+
+            for (const ref of ["Strom_Referenz_heute","Strom_Referenz_Woche","Strom_Referenz_Monat","Strom_Referenz_Kalenderjahr","Strom_Referenz_Ablesung"]) {
+                const alt = await this.getStateCached(this.config.basePath + ref) ?? 0;
+                await this.schreibeWertAsync(ref, Utils.rundenKwh(alt + diff));
             }
-
-            let aktuellerZaehlerstand = await this.getStateCached(this.config.basePath + "Strom_Zaehlerstand") ?? 0;
-            let differenz = neuerZaehlerstand - aktuellerZaehlerstand;
-
-            if (Math.abs(differenz) < 0.001) {
-                log("Zählerwechsel abgebrochen: Der neue Zählerstand entspricht bereits dem aktuellen.", "info");
-                return;
-            }
-
-            log(`Führe Zählerwechsel aus. Alter Stand: ${aktuellerZaehlerstand} kWh, Neuer Stand: ${neuerZaehlerstand} kWh. Differenz: ${differenz} kWh`, "info");
-
-            // 1. Startoffset anpassen
-            let alterStartOffset = await this.getStateCached(this.config.basePath + "Strom_Zaehler_Startoffset") ?? 0;
-            let neuerStartOffset = Utils.rundenKwh(alterStartOffset + differenz);
-            await this.schreibeWertAsync("Strom_Zaehler_Startoffset", neuerStartOffset);
-
-            // 2. Referenzen anpassen (Verbräuche bleiben somit intakt)
-            const perioden = [
-                "Strom_Referenz_heute",
-                "Strom_Referenz_Woche",
-                "Strom_Referenz_Monat",
-                "Strom_Referenz_Kalenderjahr",
-                "Strom_Referenz_Ablesung"
-            ];
-
-            for (const refId of perioden) {
-                let alteReferenz = await this.getStateCached(this.config.basePath + refId) ?? 0;
-                let neueReferenz = Utils.rundenKwh(alteReferenz + differenz);
-                await this.schreibeWertAsync(refId, neueReferenz);
-            }
-
-            // 3. Plausibilitäts-Wächter aktualisieren
-            this.letzterPlausiblerZaehlerstand = neuerZaehlerstand;
-
-            // 4. Zählerstand sofort aktualisieren
-            await this.schreibeWertAsync("Strom_Zaehlerstand", neuerZaehlerstand);
-
-            log("Zählerwechsel erfolgreich abgeschlossen. Referenzen wurden angepasst, Verbräuche bleiben intakt.", "info");
-        } catch (error) {
-            await this.handleError("Zählerwechsel", error);
-        } finally {
+            this.letzterPlausiblerZaehlerstand = neuer;
+            await this.schreibeWertAsync("Strom_Zaehlerstand", neuer);
+            log("Zählerwechsel abgeschlossen.", "info");
+        } catch (e) { await this.handleError("Zählerwechsel", e); }
+        finally {
             this.processingLock = false;
             await this.schreibeWertAsync("Strom_Zaehlerwechsel_Trigger", false, true);
         }
     }
 
+    // -------------------------------------------------------------------------
+    // ROLLOVER
+    // -------------------------------------------------------------------------
     async schichteTagesWerteUm() {
-        if (this.config.debug) log("Führe Tageswechsel aus...", "info");
-        let aktuellerZaehlerstand = this.holeWert("Strom_Zaehlerstand") || 0;
-        let verbrauchHeute = this.holeWert("Strom_Verbrauch_heute") || 0;
+        if (this.config.debug) log("Tageswechsel...", "info");
+        const stand          = this.holeWert("Strom_Zaehlerstand")       || 0;
+        const verbrauchHeute = this.holeWert("Strom_Verbrauch_heute")    || 0;
+        const pvHeute        = this.holeWert("PV_Ertrag_heute")          || 0;
+        const nettoHeute     = this.holeWert("Strom_Netto_Verbrauch_heute") || 0;
 
-        await this.schreibeWertAsync("Strom_Verbrauch_gestern", verbrauchHeute);
-        await this.schreibeWertAsync("Strom_Referenz_heute", aktuellerZaehlerstand);
-        await this.schreibeWertAsync("Strom_Verbrauch_heute", 0);
+        await this.schreibeWertAsync("Strom_Verbrauch_gestern",      verbrauchHeute);
+        await this.schreibeWertAsync("PV_Ertrag_gestern",            pvHeute);
+        await this.schreibeWertAsync("Strom_Netto_Verbrauch_gestern",nettoHeute);
+        await this.schreibeWertAsync("Strom_Referenz_heute",         stand);
+        await this.schreibeWertAsync("Strom_Verbrauch_heute",        0);
+        await this.schreibeWertAsync("PV_Ertrag_heute",              0);
+        await this.schreibeWertAsync("Strom_Netto_Verbrauch_heute",  0);
         await this.schreibeWertAsync("Strom_Letztes_Speicher_Datum", Utils.heuteIso());
+        // PV Timestamp zurücksetzen damit die erste Messung des neuen Tages
+        // nicht eine riesige Zeitlücke akkumuliert
+        await this.schreibeWertAsync("PV_Letzter_Timestamp",         Date.now());
     }
 
     async schichteWochenWerteUm() {
-        if (this.config.debug) log("Führe Wochenwechsel aus...", "info");
-        let aktuellerZaehlerstand = this.holeWert("Strom_Zaehlerstand") || 0;
-        let verbrauchWoche = this.holeWert("Strom_Verbrauch_Woche") || 0;
-        
-        await this.schreibeWertAsync("Strom_Verbrauch_letzte_Woche", verbrauchWoche);
-        await this.schreibeWertAsync("Strom_Referenz_Woche", aktuellerZaehlerstand);
-        await this.schreibeWertAsync("Strom_Verbrauch_Woche", 0);
+        if (this.config.debug) log("Wochenwechsel...", "info");
+        const stand   = this.holeWert("Strom_Zaehlerstand")    || 0;
+        const brutto  = this.holeWert("Strom_Verbrauch_Woche") || 0;
+        const pv      = this.holeWert("PV_Ertrag_Woche")       || 0;
+        const netto   = this.holeWert("Strom_Netto_Verbrauch_Woche") || 0;
+
+        await this.schreibeWertAsync("Strom_Verbrauch_letzte_Woche",  brutto);
+        await this.schreibeWertAsync("PV_Ertrag_letzte_Woche",        pv);
+        await this.schreibeWertAsync("Strom_Referenz_Woche",          stand);
+        await this.schreibeWertAsync("Strom_Verbrauch_Woche",         0);
+        await this.schreibeWertAsync("PV_Ertrag_Woche",               0);
+        await this.schreibeWertAsync("Strom_Netto_Verbrauch_Woche",   0);
     }
 
     async schichteMonatsWerteUm() {
-        if (this.config.debug) log("Führe Monatswechsel aus...", "info");
-        let aktuellerZaehlerstand = this.holeWert("Strom_Zaehlerstand") || 0;
-        let verbrauchMonat = this.holeWert("Strom_Verbrauch_Monat") || 0;
-        
-        await this.schreibeWertAsync("Strom_Verbrauch_letzter_Monat", verbrauchMonat);
-        await this.schreibeWertAsync("Strom_Referenz_Monat", aktuellerZaehlerstand);
-        await this.schreibeWertAsync("Strom_Verbrauch_Monat", 0);
+        if (this.config.debug) log("Monatswechsel...", "info");
+        const stand  = this.holeWert("Strom_Zaehlerstand")    || 0;
+        const brutto = this.holeWert("Strom_Verbrauch_Monat") || 0;
+        const pv     = this.holeWert("PV_Ertrag_Monat")       || 0;
+        const netto  = this.holeWert("Strom_Netto_Verbrauch_Monat") || 0;
+
+        await this.schreibeWertAsync("Strom_Verbrauch_letzter_Monat", brutto);
+        await this.schreibeWertAsync("PV_Ertrag_letzter_Monat",       pv);
+        await this.schreibeWertAsync("Strom_Referenz_Monat",          stand);
+        await this.schreibeWertAsync("Strom_Verbrauch_Monat",         0);
+        await this.schreibeWertAsync("PV_Ertrag_Monat",               0);
+        await this.schreibeWertAsync("Strom_Netto_Verbrauch_Monat",   0);
     }
 
     async schichteJahresWerteUm() {
-        if (this.config.debug) log("Führe Jahreswechsel aus...", "info");
-        let aktuellerZaehlerstand = this.holeWert("Strom_Zaehlerstand") || 0;
-        let verbrauchJahr = this.holeWert("Strom_Verbrauch_Kalenderjahr") || 0;
-        
-        await this.schreibeWertAsync("Strom_Verbrauch_letztes_Kalenderjahr", verbrauchJahr);
-        await this.schreibeWertAsync("Strom_Referenz_Kalenderjahr", aktuellerZaehlerstand);
-        await this.schreibeWertAsync("Strom_Verbrauch_Kalenderjahr", 0);
+        if (this.config.debug) log("Jahreswechsel...", "info");
+        const stand  = this.holeWert("Strom_Zaehlerstand")          || 0;
+        const brutto = this.holeWert("Strom_Verbrauch_Kalenderjahr") || 0;
+        const pv     = this.holeWert("PV_Ertrag_Kalenderjahr")       || 0;
+        const netto  = this.holeWert("Strom_Netto_Verbrauch_Kalenderjahr") || 0;
+
+        await this.schreibeWertAsync("Strom_Verbrauch_letztes_Kalenderjahr", brutto);
+        await this.schreibeWertAsync("PV_Ertrag_letztes_Kalenderjahr",       pv);
+        await this.schreibeWertAsync("Strom_Referenz_Kalenderjahr",          stand);
+        await this.schreibeWertAsync("Strom_Verbrauch_Kalenderjahr",         0);
+        await this.schreibeWertAsync("PV_Ertrag_Kalenderjahr",               0);
+        await this.schreibeWertAsync("Strom_Netto_Verbrauch_Kalenderjahr",   0);
     }
-    
+
+    // -------------------------------------------------------------------------
+    // STOP
+    // -------------------------------------------------------------------------
     stop() {
         this.subscriptions.forEach(sub => unsubscribe(sub));
         if (this.pendingResetTimer) clearTimeout(this.pendingResetTimer);
-        
-        // Letzte Speicherung erzwingen vor dem Beenden
-        if (this.config.metrikSpeichern) {
-            this.speichereMetriken(true).catch(e => log("Fehler beim abschließenden Metrik-Sync: " + e, "error"));
-        }
-        
-        if (this.config.debug) log(`Skript beendet. Verarbeitete Updates: ${this.metrics.updatesProcessed}, Fehler: ${this.metrics.errors}`, "info");
+        if (this.config.metrikSpeichern)
+            this.speichereMetriken(true).catch(e => log("Metrik-Sync Fehler: " + e, "error"));
+        if (this.config.debug)
+            log(`Beendet. Updates: ${this.metrics.updatesProcessed}, Fehler: ${this.metrics.errors}`, "info");
     }
 }
 
-// =========================================================================
+// ---------------------------------------------------------------------------
 // START
-// =========================================================================
+// ---------------------------------------------------------------------------
 const stromZaehler = new StromZaehlerManager(CONFIG, DATENPUNKTE);
 stromZaehler.start();
-
 onStop(() => stromZaehler.stop(), 1000);
 
 })();
