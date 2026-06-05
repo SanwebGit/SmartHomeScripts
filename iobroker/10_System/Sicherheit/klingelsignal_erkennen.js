@@ -56,7 +56,7 @@ const CONFIG = {
     },
     tuersummerDauerMs: 2000,   // Anzugsdauer Summer in ms
     sturmProtectionMs: 30000,  // Cooldown gegen Dauerklingeln in ms
-    debug: false               // Debug-Logs im ioBroker
+    debug: true               // Debug-Logs im ioBroker
 };
 
 // Interne Variablen
