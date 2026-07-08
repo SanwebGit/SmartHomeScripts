@@ -5,6 +5,8 @@
  * Autor:        Sanweb
  * * -----------------------------------------------------------------------------
  * Versionshistorie:
+ * v1.3.2  | 08.07.2026 | Korrektur: Trigger-Datenpunkt von SHORT_PRESS auf
+ *                       STATE geändert (korrekter Kanal-Datenpunkt)
  * v1.3.1  | 25.04.2026 | Konfig-Felder umbenannt: startZeit/endZeit →
  *                       alexaAktivVon/alexaAktivBis (klarere Semantik)
  * v1.3.0  | 25.04.2026 | Race Condition Init behoben, robustes Date-Parsing
@@ -23,8 +25,8 @@
 // KONFIGURATION: DATENPUNKTE (Bitte an eigene IDs anpassen)
 // ==============================================================================
 
-// Trigger: HmIP Klingelsensor (meist Kanal 1, 'PRESS_SHORT')
-const DP_KLINGEL = 'hm-rpc.0.0026E0C998D1F2.1.PRESS_SHORT';
+// Trigger: HmIP Klingelsensor (meist Kanal 1, 'STATE')
+const DP_KLINGEL = 'hm-rpc.0.0026E0C998D1F2.1.STATE';
 
 // Schalter: true = Tür öffnen, false = Alexa klingelt (Wird auto-erstellt)
 const DP_ZUTRITTSKONTROLLE = '0_userdata.0.Haustuer.Zutrittskontrolle_Haustuer';
